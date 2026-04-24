@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import curses
+import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -13,9 +15,34 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path("~/.agents/skills").expanduser()
-DEFAULT_DISABLED_ROOT = Path("~/.agents/skills-disabled").expanduser()
+DEFAULT_PROFILE = "agents"
+if os.environ.get("SKILL_TOGGLE_CONFIG_DIR"):
+    CONFIG_DIR = Path(os.environ["SKILL_TOGGLE_CONFIG_DIR"]).expanduser()
+else:
+    CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "toggle-skills"
+CONFIG_FILE = CONFIG_DIR / "roots.json"
 PROTECTED_NAMES = {".system"}
+PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def default_disabled_root(profile: str) -> Path:
+    return CONFIG_DIR / "off" / profile
+
+
+BUILTIN_PROFILES = {
+    "agents": {
+        "root": "~/.agents/skills",
+        "disabled_root": str(default_disabled_root("agents")),
+    },
+    "claude": {
+        "root": "~/.claude/skills",
+        "disabled_root": str(default_disabled_root("claude")),
+    },
+    "codex": {
+        "root": "~/.codex/skills",
+        "disabled_root": str(default_disabled_root("codex")),
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -28,6 +55,149 @@ class Skill:
     description_chars: int
     is_link: bool
     protected: bool = False
+
+
+@dataclass(frozen=True)
+class RootSelection:
+    profile: str
+    root: Path
+    disabled_root: Path
+
+
+def expand_path(value: str | Path) -> Path:
+    return Path(value).expanduser()
+
+
+def validate_profile_name(name: str) -> str:
+    if not PROFILE_RE.match(name):
+        raise RuntimeError("profile names may only contain letters, numbers, dots, underscores, and dashes")
+    return name
+
+
+def config_file_from_arg(value: Path | None) -> Path:
+    env_value = os.environ.get("SKILL_TOGGLE_CONFIG")
+    if value:
+        return expand_path(value)
+    if env_value:
+        return expand_path(env_value)
+    return CONFIG_FILE
+
+
+def load_user_config(config_file: Path) -> dict:
+    if not config_file.exists():
+        return {"profiles": {}}
+    try:
+        data = json.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"could not read config {config_file}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"config must be a JSON object: {config_file}")
+    profiles = data.get("profiles", {})
+    if not isinstance(profiles, dict):
+        raise RuntimeError(f"config profiles must be an object: {config_file}")
+    data["profiles"] = profiles
+    return data
+
+
+def save_user_config(config_file: Path, config: dict) -> None:
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(f"{json.dumps(config, indent=2, sort_keys=True)}\n", encoding="utf-8")
+
+
+def merged_profiles(config: dict) -> dict[str, dict[str, str]]:
+    profiles = {name: dict(value) for name, value in BUILTIN_PROFILES.items()}
+    for name, value in config.get("profiles", {}).items():
+        validate_profile_name(name)
+        if not isinstance(value, dict):
+            raise RuntimeError(f"profile must be an object: {name}")
+        root = value.get("root")
+        disabled_root = value.get("disabled_root")
+        if not isinstance(root, str) or not root:
+            raise RuntimeError(f"profile {name} must define root")
+        if disabled_root is not None and (not isinstance(disabled_root, str) or not disabled_root):
+            raise RuntimeError(f"profile {name} has invalid disabled_root")
+        profiles[name] = {
+            "root": root,
+            "disabled_root": disabled_root or str(default_disabled_root(name)),
+        }
+    return profiles
+
+
+def add_profile(config_file: Path, name: str, root: Path, disabled_root: Path | None) -> str:
+    name = validate_profile_name(name)
+    config = load_user_config(config_file)
+    profiles = config.setdefault("profiles", {})
+    profiles[name] = {
+        "root": str(root.expanduser()),
+        "disabled_root": str((disabled_root or default_disabled_root(name)).expanduser()),
+    }
+    save_user_config(config_file, config)
+    return f"saved profile {name}: root={profiles[name]['root']} disabled={profiles[name]['disabled_root']}"
+
+
+def set_default_profile(config_file: Path, name: str) -> str:
+    name = validate_profile_name(name)
+    config = load_user_config(config_file)
+    profiles = merged_profiles(config)
+    if name not in profiles:
+        raise RuntimeError(f"unknown profile: {name}")
+    config["default"] = name
+    save_user_config(config_file, config)
+    return f"default profile: {name}"
+
+
+def remove_profile(config_file: Path, name: str) -> str:
+    name = validate_profile_name(name)
+    if name in BUILTIN_PROFILES:
+        raise RuntimeError(f"cannot remove built-in profile: {name}")
+    config = load_user_config(config_file)
+    profiles = config.setdefault("profiles", {})
+    if name not in profiles:
+        raise RuntimeError(f"custom profile not found: {name}")
+    del profiles[name]
+    if config.get("default") == name:
+        config.pop("default", None)
+    save_user_config(config_file, config)
+    return f"removed profile: {name}"
+
+
+def print_profiles(config_file: Path) -> None:
+    config = load_user_config(config_file)
+    profiles = merged_profiles(config)
+    default_profile = config.get("default", DEFAULT_PROFILE)
+    custom_names = set(config.get("profiles", {}))
+    for name in sorted(profiles):
+        marker = "*" if name == default_profile else " "
+        source = "custom" if name in custom_names else "builtin"
+        profile = profiles[name]
+        print(f"{marker} {name:<12} {source:<7} root={profile['root']} disabled={profile['disabled_root']}")
+
+
+def resolve_roots(args: argparse.Namespace, config_file: Path) -> RootSelection:
+    root_arg = args.root or (Path(os.environ["SKILL_TOGGLE_ROOT"]) if os.environ.get("SKILL_TOGGLE_ROOT") else None)
+    disabled_arg = args.disabled_root or (
+        Path(os.environ["SKILL_TOGGLE_DISABLED_ROOT"]) if os.environ.get("SKILL_TOGGLE_DISABLED_ROOT") else None
+    )
+    profile = args.profile or os.environ.get("SKILL_TOGGLE_PROFILE")
+    if root_arg:
+        resolved_profile = validate_profile_name(profile or "custom")
+        return RootSelection(
+            resolved_profile,
+            expand_path(root_arg),
+            expand_path(disabled_arg or default_disabled_root(resolved_profile)),
+        )
+
+    config = load_user_config(config_file)
+    profiles = merged_profiles(config)
+    resolved_profile = validate_profile_name(profile or config.get("default", DEFAULT_PROFILE))
+    if resolved_profile not in profiles:
+        raise RuntimeError(f"unknown profile: {resolved_profile}")
+    profile_config = profiles[resolved_profile]
+    return RootSelection(
+        resolved_profile,
+        expand_path(profile_config["root"]),
+        expand_path(disabled_arg or profile_config["disabled_root"]),
+    )
 
 
 def parse_frontmatter(skill_md: Path) -> tuple[str, str]:
@@ -215,7 +385,7 @@ def draw(stdscr: curses.window, state: dict) -> None:
     preview_offset = state["preview_offset"]
     message = state["message"]
 
-    header = f"skill-toggle  root={state['root']}  disabled={state['disabled_root']}"
+    header = f"skill-toggle  profile={state['profile']}  root={state['root']}  disabled={state['disabled_root']}"
     stdscr.addstr(0, 0, trim(header, width - 1), curses.A_BOLD)
     status_line = (
         f"filter={status_filter}  sort={sort_mode}  search={query or '-'}  "
@@ -277,14 +447,15 @@ def draw(stdscr: curses.window, state: dict) -> None:
     stdscr.refresh()
 
 
-def tui(root: Path, disabled_root: Path) -> None:
+def tui(selection: RootSelection) -> None:
     def run(stdscr: curses.window) -> None:
         curses.curs_set(0)
         stdscr.keypad(True)
         state = {
-            "root": str(root),
-            "disabled_root": str(disabled_root),
-            "skills": scan(root, disabled_root),
+            "profile": selection.profile,
+            "root": str(selection.root),
+            "disabled_root": str(selection.disabled_root),
+            "skills": scan(selection.root, selection.disabled_root),
             "visible": [],
             "selected": 0,
             "offset": 0,
@@ -335,7 +506,7 @@ def tui(root: Path, disabled_root: Path) -> None:
                         state["message"] = "enable the skill before updating it"
                     else:
                         state["message"] = run_update_interactive(stdscr, skill.name)
-                        state["skills"] = scan(root, disabled_root)
+                        state["skills"] = scan(selection.root, selection.disabled_root)
                 else:
                     state["message"] = "update cancelled"
                 state["mode"] = "normal"
@@ -344,7 +515,7 @@ def tui(root: Path, disabled_root: Path) -> None:
             if state["mode"] == "confirm_update_all":
                 if key in (ord("y"), ord("Y")):
                     state["message"] = run_update_interactive(stdscr, None)
-                    state["skills"] = scan(root, disabled_root)
+                    state["skills"] = scan(selection.root, selection.disabled_root)
                 else:
                     state["message"] = "update cancelled"
                 state["mode"] = "normal"
@@ -390,15 +561,15 @@ def tui(root: Path, disabled_root: Path) -> None:
                 state["selected"] = 0
                 state["offset"] = 0
             elif key == ord("r"):
-                state["skills"] = scan(root, disabled_root)
+                state["skills"] = scan(selection.root, selection.disabled_root)
                 state["message"] = "refreshed"
             elif key == ord(" "):
                 if not state["visible"]:
                     continue
                 skill = state["visible"][state["selected"]]
                 try:
-                    state["message"] = move_skill(skill, root, disabled_root)
-                    state["skills"] = scan(root, disabled_root)
+                    state["message"] = move_skill(skill, selection.root, selection.disabled_root)
+                    state["skills"] = scan(selection.root, selection.disabled_root)
                 except RuntimeError as exc:
                     state["message"] = str(exc)
 
@@ -415,11 +586,17 @@ def print_list(skills: list[Skill], limit: int | None = None) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Enable/disable local agent skills by moving skill folders.")
-    parser.add_argument("--root", type=Path, default=Path(os.environ.get("SKILL_TOGGLE_ROOT", DEFAULT_ROOT)))
+    parser.add_argument("--profile", help=f"Named skill root profile. Built-ins: {', '.join(sorted(BUILTIN_PROFILES))}.")
+    parser.add_argument("--profiles", action="store_true", help="List configured skill root profiles.")
+    parser.add_argument("--config", type=Path, help=f"Config file path. Default: {CONFIG_FILE}.")
+    parser.add_argument("--add-root", nargs=2, metavar=("PROFILE", "PATH"), help="Save a custom skill root profile.")
+    parser.add_argument("--set-default", metavar="PROFILE", help="Set the default profile.")
+    parser.add_argument("--remove-root", metavar="PROFILE", help="Remove a custom profile.")
+    parser.add_argument("--root", type=Path, help="One-off live skill root override.")
     parser.add_argument(
         "--disabled-root",
         type=Path,
-        default=Path(os.environ.get("SKILL_TOGGLE_DISABLED_ROOT", DEFAULT_DISABLED_ROOT)),
+        help="One-off disabled skill root override.",
     )
     parser.add_argument("--list", action="store_true", help="Print skills without opening the TUI.")
     parser.add_argument(
@@ -438,15 +615,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    root = args.root.expanduser()
-    disabled_root = args.disabled_root.expanduser()
+    config_file = config_file_from_arg(args.config)
     try:
+        if args.add_root:
+            profile, root = args.add_root
+            print(add_profile(config_file, profile, Path(root), args.disabled_root))
+            return 0
+        if args.set_default:
+            print(set_default_profile(config_file, args.set_default))
+            return 0
+        if args.remove_root:
+            print(remove_profile(config_file, args.remove_root))
+            return 0
+        if args.profiles:
+            print_profiles(config_file)
+            return 0
+        selection = resolve_roots(args, config_file)
         if args.enable:
-            print(enable_skill(args.enable, root, disabled_root))
+            print(enable_skill(args.enable, selection.root, selection.disabled_root))
             print("Restart Codex/Claude or open a new session for discovery changes to apply.")
             return 0
         if args.disable:
-            print(disable_skill(args.disable, root, disabled_root))
+            print(disable_skill(args.disable, selection.root, selection.disabled_root))
             print("Restart Codex/Claude or open a new session for discovery changes to apply.")
             return 0
         if args.update:
@@ -455,11 +645,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.update_all:
             code = run_skills_update(None)
             return code
-        skills = render_list(scan(root, disabled_root), "", "all", args.sort)
+        skills = render_list(scan(selection.root, selection.disabled_root), "", "all", args.sort)
         if args.list or not sys.stdin.isatty() or not sys.stdout.isatty():
             print_list(skills, args.limit)
             return 0
-        tui(root, disabled_root)
+        tui(selection)
         return 0
     except KeyboardInterrupt:
         return 130

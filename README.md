@@ -11,15 +11,19 @@ It was built for Codex/Claude-style skill directories where each skill lives in 
 - Previews the selected `SKILL.md`.
 - Sorts by name or description size.
 - Searches by name, display name, or description.
+- Supports named roots/profiles, including `~/.agents/skills` and `~/.claude/skills`.
 - Runs `npx skills update` for one enabled skill or all global skills.
 - Avoids deletion: toggling only renames/moves folders or symlinks.
 
-Default paths:
+Built-in profiles:
 
 ```text
-enabled:  ~/.agents/skills
-disabled: ~/.agents/skills-disabled
+agents: enabled=~/.agents/skills  off=~/.config/toggle-skills/off/agents
+claude: enabled=~/.claude/skills  off=~/.config/toggle-skills/off/claude
+codex:  enabled=~/.codex/skills   off=~/.config/toggle-skills/off/codex
 ```
+
+The default profile is `agents`.
 
 ## Install
 
@@ -55,6 +59,7 @@ Open the TUI:
 
 ```bash
 skill-toggle
+skill-toggle --profile claude
 ```
 
 Useful keys:
@@ -76,23 +81,43 @@ Non-interactive commands:
 
 ```bash
 skill-toggle --list --sort desc-size-desc --limit 20
+skill-toggle --profile claude --list
 skill-toggle --disable ctf-web
 skill-toggle --enable ctf-web
 skill-toggle --update ctf-web
 skill-toggle --update-all
 ```
 
-Use alternate roots:
+List or add roots:
 
 ```bash
-skill-toggle --root ~/.agents/skills --disabled-root ~/.agents/skills-disabled
+skill-toggle --profiles
+skill-toggle --add-root my-agent ~/.my-agent/skills
+skill-toggle --add-root my-agent ~/.my-agent/skills --disabled-root ~/.config/toggle-skills/off/my-agent
+skill-toggle --set-default claude
+skill-toggle --remove-root my-agent
+```
+
+Custom roots are stored in:
+
+```text
+~/.config/toggle-skills/roots.json
+```
+
+Use one-off alternate roots without saving a profile:
+
+```bash
+skill-toggle --root ~/.claude/skills --disabled-root ~/.config/toggle-skills/off/claude
 ```
 
 Or through environment variables:
 
 ```bash
+SKILL_TOGGLE_PROFILE=claude \
+skill-toggle
+
 SKILL_TOGGLE_ROOT=~/.agents/skills \
-SKILL_TOGGLE_DISABLED_ROOT=~/.agents/skills-disabled \
+SKILL_TOGGLE_DISABLED_ROOT=~/.config/toggle-skills/off/agents \
 skill-toggle
 ```
 

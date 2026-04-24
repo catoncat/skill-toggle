@@ -50,7 +50,32 @@ class SkillToggleTests(unittest.TestCase):
         self.assertEqual([s.name for s in cli.sort_skills([short, long], "desc-size-desc")], ["long", "short"])
         self.assertEqual([s.name for s in cli.sort_skills([short, long], "desc-size-asc")], ["short", "long"])
 
+    def test_builtin_claude_profile_uses_claude_skill_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_file = Path(tmp) / "roots.json"
+            args = cli.build_parser().parse_args(["--profile", "claude", "--config", str(config_file)])
+
+            selection = cli.resolve_roots(args, config_file)
+
+            self.assertEqual(selection.profile, "claude")
+            self.assertEqual(selection.root, Path("~/.claude/skills").expanduser())
+            self.assertEqual(selection.disabled_root, cli.default_disabled_root("claude"))
+
+    def test_custom_profile_round_trips_through_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_file = Path(tmp) / "roots.json"
+            root = Path(tmp) / "lab-skills"
+            disabled = Path(tmp) / "lab-off"
+
+            message = cli.add_profile(config_file, "lab", root, disabled)
+            args = cli.build_parser().parse_args(["--profile", "lab", "--config", str(config_file)])
+            selection = cli.resolve_roots(args, config_file)
+
+            self.assertIn("saved profile lab", message)
+            self.assertEqual(selection.profile, "lab")
+            self.assertEqual(selection.root, root)
+            self.assertEqual(selection.disabled_root, disabled)
+
 
 if __name__ == "__main__":
     unittest.main()
-
