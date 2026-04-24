@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-skill-toggle"
+version = "0.1.0"
+description = "A small curses TUI for enabling and disabling local agent skills."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+  { name = "catoncat" }
+]
+keywords = ["codex", "skills", "agents", "tui", "curses"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console :: Curses",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development",
+  "Topic :: Utilities"
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/catoncat/skill-toggle"
+Repository = "https://github.com/catoncat/skill-toggle"
+Issues = "https://github.com/catoncat/skill-toggle/issues"
+
+[project.scripts]
+skill-toggle = "skill_toggle.cli:main"
+
+[tool.setuptools]
+packages = ["skill_toggle"]
