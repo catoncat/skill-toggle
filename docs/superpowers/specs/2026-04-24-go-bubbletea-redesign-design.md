@@ -1,5 +1,10 @@
 # Go Bubble Tea Redesign Design
 
+> **Status: Superseded** by [`2026-04-27-tui-redesign-aggregated-lazygit.md`](./2026-04-27-tui-redesign-aggregated-lazygit.md).
+> The profile-first model described here turned out to be the wrong abstraction. The replacement
+> spec drops profiles in favour of an aggregated skill view across all three roots, a single global
+> off directory, and a lazygit-style TUI.
+
 ## Summary
 
 Rebuild `skill-toggle` as a native-feeling terminal application with a single-file binary distribution. The current Python/curses version proved the workflow: scan skill roots, preview `SKILL.md`, toggle folders between enabled and off roots, manage profiles, and call `npx skills update`. The next version should keep that behavior while making the app feel like a deliberate skills control center instead of a thin folder-moving script.

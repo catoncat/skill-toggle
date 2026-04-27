@@ -5,126 +5,282 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 )
 
-// Color palette using Lip Gloss adaptive colors for light/dark terminal support.
+// Color palette — lazygit-inspired: muted greys, a single soft accent for the
+// active panel, semantic green/yellow/red for status & staging signals only.
 var (
-	Accent  = lipgloss.AdaptiveColor{Light: "#6C47FF", Dark: "#8B6BFF"}
-	Success = lipgloss.AdaptiveColor{Light: "#008000", Dark: "#00D700"}
-	Dimmed  = lipgloss.AdaptiveColor{Light: "#909090", Dark: "#626262"}
-	Warning = lipgloss.AdaptiveColor{Light: "#CC8800", Dark: "#FFD700"}
-	Danger  = lipgloss.AdaptiveColor{Light: "#CC0000", Dark: "#FF4444"}
+	Text         = lipgloss.AdaptiveColor{Light: "#1F2430", Dark: "#D7DAE0"}
+	Muted        = lipgloss.AdaptiveColor{Light: "#7A8190", Dark: "#7A8190"}
+	Subtle       = lipgloss.AdaptiveColor{Light: "#A0A6B0", Dark: "#5A6068"}
+	Border       = lipgloss.AdaptiveColor{Light: "#C2C7D0", Dark: "#3A3F4A"}
+	BorderActive = lipgloss.AdaptiveColor{Light: "#3D74B0", Dark: "#7AAFE5"}
+	Accent       = lipgloss.AdaptiveColor{Light: "#3D74B0", Dark: "#7AAFE5"}
+	Success      = lipgloss.AdaptiveColor{Light: "#2C8A4E", Dark: "#5FB875"}
+	Warning      = lipgloss.AdaptiveColor{Light: "#A06000", Dark: "#D4A75A"}
+	Danger       = lipgloss.AdaptiveColor{Light: "#B43836", Dark: "#E37A75"}
+	SelectionBg  = lipgloss.AdaptiveColor{Light: "#D8E3F2", Dark: "#2A3340"}
 )
 
-var (
-	// Base styles used internally to compose the exported functions.
-	tabActive    = lipgloss.NewStyle().Padding(0, 2).Foreground(Accent).Bold(true).Underline(true)
-	tabInactive  = lipgloss.NewStyle().Padding(0, 2).Foreground(Dimmed)
-	tabBar       = lipgloss.NewStyle().MarginBottom(1)
-	statusBar    = lipgloss.NewStyle().Padding(0, 1).Foreground(Dimmed).Width(60)
-	stats        = lipgloss.NewStyle().Foreground(Dimmed)
-	enabledBadge = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#000000")).
-			Background(Success).
-			Padding(0, 1).
-			Bold(true)
-	disabledBadge = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#000000")).
-			Background(Dimmed).
-			Padding(0, 1).
-			Bold(true)
-	previewTitle   = lipgloss.NewStyle().Bold(true).Foreground(Accent).MarginBottom(1)
-	previewContent = lipgloss.NewStyle().Padding(0, 2)
-	title          = lipgloss.NewStyle().Bold(true).Foreground(Accent).Padding(0, 1)
-	footer         = lipgloss.NewStyle().Foreground(Dimmed).Padding(0, 1).MarginTop(1)
-	errStyle       = lipgloss.NewStyle().Foreground(Danger).Bold(true)
-	infoStyle      = lipgloss.NewStyle().Foreground(Dimmed)
-	searchInput    = lipgloss.NewStyle().Padding(0, 1).Width(30)
-	commandPalette = lipgloss.NewStyle().Padding(0, 1).Border(lipgloss.RoundedBorder()).Width(50)
-	confirmDialog  = lipgloss.NewStyle().Padding(1, 2).Border(lipgloss.DoubleBorder()).Width(40)
-)
-
-// TabStyle returns a style for a profile tab. Active tabs are underlined and
-// accented; inactive tabs are dimmed.
-func TabStyle(active bool) lipgloss.Style {
+// Panel renders a bordered region. width and height count the OUTER size
+// (border-inclusive). Pass active=true to highlight the border.
+func Panel(title string, body string, width, height int, active bool) string {
+	border := Border
 	if active {
-		return tabActive
+		border = BorderActive
 	}
-	return tabInactive
+	style := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(border).
+		Padding(0, 1)
+
+	// lipgloss style.Width sets padding+content, so we subtract just the
+	// border to land on the requested outer width after rendering.
+	frameW := width - style.GetHorizontalBorderSize()
+	if frameW < 1 {
+		frameW = 1
+	}
+	frameH := height - style.GetVerticalBorderSize()
+	if frameH < 1 {
+		frameH = 1
+	}
+
+	contentWidth := frameW - style.GetHorizontalPadding()
+	if contentWidth < 1 {
+		contentWidth = 1
+	}
+	contentHeight := frameH - style.GetVerticalPadding()
+	if contentHeight < 1 {
+		contentHeight = 1
+	}
+
+	titleStyled := PanelTitle(title, active, contentWidth)
+	bodyHeight := contentHeight - 1
+	if bodyHeight < 0 {
+		bodyHeight = 0
+	}
+	bodyLines := strings.Split(body, "\n")
+	if len(bodyLines) > bodyHeight {
+		bodyLines = bodyLines[:bodyHeight]
+	}
+	for len(bodyLines) < bodyHeight {
+		bodyLines = append(bodyLines, "")
+	}
+	for i, line := range bodyLines {
+		bodyLines[i] = PadRight(TrimToWidth(line, contentWidth), contentWidth)
+	}
+	content := titleStyled
+	if len(bodyLines) > 0 {
+		content += "\n" + strings.Join(bodyLines, "\n")
+	}
+	return style.Width(frameW).Height(frameH).Render(content)
 }
 
-// TabBarStyle returns the style wrapping the tab row.
-func TabBarStyle() lipgloss.Style { return tabBar }
-
-// StatusBarStyle returns the style for the status bar.
-func StatusBarStyle() lipgloss.Style { return statusBar }
-
-// StatsStyle returns the style for inline statistics.
-func StatsStyle() lipgloss.Style { return stats }
-
-// SkillRowStyle returns a style for a single skill row. When selected the row
-// is highlighted with the accent color.
-func SkillRowStyle(selected bool, status string) lipgloss.Style {
-	s := lipgloss.NewStyle().Padding(0, 1)
-	if selected {
-		s = s.Background(Accent).Foreground(lipgloss.Color("#000000"))
+// PanelTitle renders a panel title line. When active, the title gets the
+// accent color and a small marker so the user can find it without reading
+// border colors only.
+func PanelTitle(title string, active bool, width int) string {
+	prefix := "  "
+	color := Muted
+	if active {
+		prefix = "● "
+		color = Accent
 	}
-	return s
+	titleStyle := lipgloss.NewStyle().Foreground(color).Bold(active)
+	rendered := titleStyle.Render(prefix + title)
+	pad := width - lipgloss.Width(rendered)
+	if pad > 0 {
+		rendered += strings.Repeat(" ", pad)
+	} else if pad < 0 {
+		rendered = TrimToWidth(rendered, width)
+	}
+	return rendered
 }
 
-// EnabledBadge returns the "enabled" badge style.
-func EnabledBadge() lipgloss.Style { return enabledBadge }
-
-// DisabledBadge returns the "disabled" badge style.
-func DisabledBadge() lipgloss.Style { return disabledBadge }
-
-// PreviewTitleStyle returns the style for the preview pane title.
-func PreviewTitleStyle() lipgloss.Style { return previewTitle }
-
-// PreviewContentStyle returns the style for the preview pane content.
-func PreviewContentStyle() lipgloss.Style { return previewContent }
-
-// TitleStyle returns the style for the main application title.
-func TitleStyle() lipgloss.Style { return title }
-
-// FooterStyle returns the style for the footer.
-func FooterStyle() lipgloss.Style { return footer }
-
-// ErrorStyle returns the style for error messages.
-func ErrorStyle() lipgloss.Style { return errStyle }
-
-// InfoStyle returns the style for informational messages.
-func InfoStyle() lipgloss.Style { return infoStyle }
-
-// SearchInputStyle returns the style for the search/filter input.
-func SearchInputStyle() lipgloss.Style { return searchInput }
-
-// CommandPaletteStyle returns the style for the command palette overlay.
-func CommandPaletteStyle() lipgloss.Style { return commandPalette }
-
-// ConfirmDialogStyle returns the style for confirmation dialogs.
-func ConfirmDialogStyle() lipgloss.Style { return confirmDialog }
-
-// TrimToWidth truncates text with an ellipsis if it exceeds the given width.
-//   - If width <= 0, returns "".
-//   - If len(text) <= width, returns text unchanged.
-//   - If width <= 1, returns text[:width] (no room for ellipsis).
-//   - Otherwise returns text[:width-1] + "…".
-func TrimToWidth(text string, width int) string {
-	if width <= 0 {
-		return ""
+// SkillRow formats a single row in the Enabled/Disabled list.
+//
+// width       = total cell width
+// selected    = cursor sits on this row in the panel
+// activePanel = whether the panel containing this row currently has focus
+// staged      = the row is staged for toggling
+//
+// Layout (visible columns):
+//
+//	<staged><cursor><name>SP<source>SP<chars>[SP<description>]
+//	  1       2      N    1   7     1   5     1   M
+//
+// Status (ON/OFF) is conveyed by panel placement plus name color: enabled
+// rows leave the foreground unset (terminal default — adapts to dark/light
+// themes without relying on Lip Gloss adaptive color), disabled rows use
+// Muted. The column algorithm gives name the room it needs first, then
+// hands the rest to description; description is dropped when there's less
+// than 6 visible columns left so a 1-2 char trailing description doesn't
+// look like garbage. Total visible width is held to exactly `width` so the
+// outer Panel never has to re-trim a styled string (which would risk
+// cutting an ANSI escape sequence in half and producing replacement glyphs
+// like `◇` / `�`).
+func SkillRow(name, source, description string, descChars int, status string, selected, activePanel, staged bool, width int) string {
+	if width < 10 {
+		return TrimToWidth(name, width)
 	}
-	if len(text) <= width {
-		return text
+
+	cursor := "  "
+	if selected && activePanel {
+		cursor = "▌ "
+	} else if selected {
+		cursor = "› "
 	}
-	if width <= 1 {
-		return text[:width]
+
+	stagedMarker := " "
+	if staged {
+		stagedMarker = lipgloss.NewStyle().Foreground(Warning).Bold(true).Render("~")
 	}
-	return text[:width-1] + "…"
+
+	const (
+		stagedW    = 1
+		cursorW    = 2
+		sourceW    = 7
+		charsW     = 5
+		nameMin    = 4
+		descMin    = 6
+		fixedNoDesc   = stagedW + cursorW + 1 + sourceW + 1 + charsW // 17
+		fixedWithDesc = fixedNoDesc + 1                              // 18 (desc spacer)
+	)
+
+	nameWant := lipgloss.Width(name)
+
+	var nameW, descW int
+	switch {
+	case width-fixedWithDesc-nameWant >= descMin:
+		nameW = nameWant
+		descW = width - fixedWithDesc - nameW
+	case width-fixedNoDesc >= nameWant:
+		nameW = nameWant
+		descW = 0
+	case width-fixedNoDesc >= nameMin:
+		nameW = width - fixedNoDesc
+		descW = 0
+	default:
+		nameW = nameMin
+		descW = 0
+	}
+
+	nameStyle := lipgloss.NewStyle()
+	descStyle := lipgloss.NewStyle().Foreground(Muted)
+	if status != "enabled" {
+		nameStyle = lipgloss.NewStyle().Foreground(Muted)
+		descStyle = lipgloss.NewStyle().Foreground(Subtle)
+	}
+	sourceStyle := lipgloss.NewStyle().Foreground(Muted)
+	charsStyle := lipgloss.NewStyle().Foreground(Subtle)
+
+	parts := []string{
+		stagedMarker,
+		cursor,
+		PadRight(nameStyle.Render(TrimToWidth(name, nameW)), nameW),
+		" ",
+		PadRight(sourceStyle.Render(TrimToWidth(source, sourceW)), sourceW),
+		" ",
+		PadRight(charsStyle.Render(FormatDescChars(descChars)), charsW),
+	}
+	if descW > 0 {
+		parts = append(parts, " ", descStyle.Render(TrimToWidth(description, descW)))
+	}
+	row := strings.Join(parts, "")
+	rowWidth := lipgloss.Width(row)
+	if rowWidth < width {
+		row += strings.Repeat(" ", width-rowWidth)
+	}
+
+	if selected && activePanel {
+		row = lipgloss.NewStyle().Background(SelectionBg).Render(row)
+	}
+	return row
 }
 
-// FormatDescChars formats a description character count with a human-readable
-// unit suffix, e.g. 12400 -> "12.4k", 500 -> "500", 0 -> "0".
+// PreviewMetadataLine formats one metadata row in the right pane. The label
+// is dimmed; the value uses the terminal's default foreground so it adapts
+// to dark/light themes without relying on Lip Gloss adaptive color.
+func PreviewMetadataLine(label, value string, width int) string {
+	labelStyled := lipgloss.NewStyle().Foreground(Muted).Render(label)
+	valueWidth := width - lipgloss.Width(labelStyled) - 1
+	if valueWidth < 1 {
+		valueWidth = 1
+	}
+	return labelStyled + " " + TrimToWidth(value, valueWidth)
+}
+
+// PreviewBodyLine renders one line of SKILL.md body, applying a tiny accent
+// to markdown headings so the wall of text isn't completely flat. Body
+// paragraphs use the terminal default foreground (no Lip Gloss color set)
+// so dark/light themes both render with sensible contrast.
+func PreviewBodyLine(line string, width int) string {
+	trimmed := strings.TrimLeft(line, " \t")
+	if strings.HasPrefix(trimmed, "#") {
+		return lipgloss.NewStyle().Foreground(Accent).Bold(true).Render(TrimToWidth(line, width))
+	}
+	if strings.HasPrefix(trimmed, "> ") {
+		return lipgloss.NewStyle().Foreground(Muted).Italic(true).Render(TrimToWidth(line, width))
+	}
+	return TrimToWidth(line, width)
+}
+
+// KeyHint renders a single "[key] label" pair for the bottom strip.
+func KeyHint(key, label string) string {
+	keyStyle := lipgloss.NewStyle().Foreground(Accent).Bold(true)
+	textStyle := lipgloss.NewStyle().Foreground(Muted)
+	return keyStyle.Render(key) + " " + textStyle.Render(label)
+}
+
+// SearchPrompt formats the inline search input shown above the active panel.
+func SearchPrompt(query string, width int) string {
+	prefix := lipgloss.NewStyle().Foreground(Accent).Bold(true).Render("/ ")
+	cursor := lipgloss.NewStyle().Foreground(Accent).Render("▍")
+	hint := lipgloss.NewStyle().Foreground(Subtle).Italic(true).Render(" matches name · source · description")
+	rendered := prefix + lipgloss.NewStyle().Foreground(Text).Render(query) + cursor
+	used := lipgloss.Width(rendered) + lipgloss.Width(hint)
+	if used <= width {
+		return rendered + strings.Repeat(" ", width-used) + hint
+	}
+	return TrimToWidth(rendered, width)
+}
+
+// StatusMessage renders an info or error blob suitable for the bottom strip.
+func StatusMessage(text string, isError bool) string {
+	if isError {
+		return lipgloss.NewStyle().Foreground(Danger).Bold(true).Render(text)
+	}
+	return lipgloss.NewStyle().Foreground(Success).Render(text)
+}
+
+// MutedText renders dim secondary text.
+func MutedText(text string) string {
+	return lipgloss.NewStyle().Foreground(Muted).Render(text)
+}
+
+// HelpOverlayBox builds a centered help block — bordered, body left-aligned.
+func HelpOverlayBox(body string, width int) string {
+	style := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(Accent).
+		Padding(1, 2).
+		Foreground(Text)
+	innerWidth := width - style.GetHorizontalFrameSize()
+	if innerWidth < 20 {
+		innerWidth = 20
+	}
+	return style.Width(innerWidth).Render(body)
+}
+
+// ConfirmPrompt is shown inline at the bottom for y/N decisions.
+func ConfirmPrompt(question string) string {
+	q := lipgloss.NewStyle().Foreground(Warning).Bold(true).Render(question)
+	hint := lipgloss.NewStyle().Foreground(Muted).Render("  (y/N)")
+	return q + hint
+}
+
+// FormatDescChars compacts character counts (1.4k for >=1000).
 func FormatDescChars(n int) string {
 	if n < 1000 {
 		return fmt.Sprintf("%d", n)
@@ -132,26 +288,76 @@ func FormatDescChars(n int) string {
 	return fmt.Sprintf("%.1fk", float64(n)/1000)
 }
 
-// PadRight pads s with spaces to the given width. If s is already longer than
-// width, it is returned unchanged.
-func PadRight(s string, width int) string {
-	if len(s) >= width {
+// PadRight right-pads s to display width w.
+func PadRight(s string, w int) string {
+	width := lipgloss.Width(s)
+	if width >= w {
 		return s
 	}
-	return s + strings.Repeat(" ", width-len(s))
+	return s + strings.Repeat(" ", w-width)
 }
 
-// TruncateLeft truncates a string from the left if it exceeds the given width,
-// prefixing the result with "…". e.g. TruncateLeft("hello", 4) -> "…llo".
+// TrimToWidth trims s to fit visual width w, appending an ellipsis if cut.
+func TrimToWidth(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(text) <= width {
+		return text
+	}
+	if width <= 1 {
+		return trimRunesToWidth(text, width)
+	}
+	return trimRunesToWidth(text, width-1) + "…"
+}
+
+// TruncateLeft trims with an ellipsis prefix, preserving the rightmost
+// visible characters (handy for paths).
 func TruncateLeft(s string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	if len(s) <= width {
+	if lipgloss.Width(s) <= width {
 		return s
 	}
 	if width <= 1 {
 		return "…"
 	}
-	return "…" + s[len(s)-width+1:]
+	runes := []rune(s)
+	target := width - lipgloss.Width("…")
+	if target <= 0 {
+		return "…"
+	}
+	var tail []rune
+	currentWidth := 0
+	for i := len(runes) - 1; i >= 0; i-- {
+		r := runes[i]
+		rw := runewidth.RuneWidth(r)
+		if currentWidth+rw > target {
+			break
+		}
+		tail = append(tail, r)
+		currentWidth += rw
+	}
+	for i, j := 0, len(tail)-1; i < j; i, j = i+1, j-1 {
+		tail[i], tail[j] = tail[j], tail[i]
+	}
+	return "…" + string(tail)
+}
+
+func trimRunesToWidth(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	var b strings.Builder
+	currentWidth := 0
+	for _, r := range s {
+		rw := runewidth.RuneWidth(r)
+		if currentWidth+rw > width {
+			break
+		}
+		b.WriteRune(r)
+		currentWidth += rw
+	}
+	return b.String()
 }

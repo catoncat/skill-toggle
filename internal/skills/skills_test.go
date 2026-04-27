@@ -101,8 +101,8 @@ func TestParseFrontmatterQuotedName(t *testing.T) {
 }
 
 func TestSortByDescriptionSize(t *testing.T) {
-	short := Skill{Name: "short", Status: "enabled", Path: "/tmp/short", DescriptionChars: 1}
-	long := Skill{Name: "long", Status: "enabled", Path: "/tmp/long", DescriptionChars: 5}
+	short := Skill{Name: "short", Source: "agents", Status: "enabled", DescriptionChars: 1}
+	long := Skill{Name: "long", Source: "agents", Status: "enabled", DescriptionChars: 5}
 
 	names := func(skills []Skill) []string {
 		out := make([]string, len(skills))
@@ -124,8 +124,8 @@ func TestSortByDescriptionSize(t *testing.T) {
 }
 
 func TestSortByNameEnabledFirst(t *testing.T) {
-	enabled := Skill{Name: "b", Status: "enabled", Path: "/tmp/b"}
-	disabled := Skill{Name: "a", Status: "disabled", Path: "/tmp/a"}
+	enabled := Skill{Name: "b", Source: "agents", Status: "enabled"}
+	disabled := Skill{Name: "a", Source: "agents", Status: "disabled"}
 
 	result := SortSkills([]Skill{disabled, enabled}, SortByName)
 	if result[0].Name != "b" || result[1].Name != "a" {
@@ -135,19 +135,17 @@ func TestSortByNameEnabledFirst(t *testing.T) {
 
 func TestFilterSkills(t *testing.T) {
 	skills := []Skill{
-		{Name: "alpha", DisplayName: "Alpha", Description: "first", Status: "enabled"},
-		{Name: "beta", DisplayName: "Beta", Description: "second", Status: "disabled"},
-		{Name: "gamma", DisplayName: "Gamma", Description: "third beta", Status: "enabled"},
+		{Name: "alpha", Source: "agents", DisplayName: "Alpha", Description: "first", Status: "enabled"},
+		{Name: "beta", Source: "claude", DisplayName: "Beta", Description: "second", Status: "disabled"},
+		{Name: "gamma", Source: "agents", DisplayName: "Gamma", Description: "third beta", Status: "enabled"},
 	}
 
 	result := FilterSkills(skills, "beta", "all", SortByName)
 	if len(result) != 2 {
 		t.Fatalf("expected 2 matches for 'beta', got %d", len(result))
 	}
-	// SortByName puts enabled skills first, so gamma (enabled, contains "beta" in desc)
-	// comes before beta (disabled, name match).
 	if result[0].Name != "gamma" {
-		t.Errorf("expected gamma first (enabled before disabled), got %s", result[0].Name)
+		t.Errorf("expected gamma first (enabled), got %s", result[0].Name)
 	}
 	if result[1].Name != "beta" {
 		t.Errorf("expected beta second, got %s", result[1].Name)
@@ -159,87 +157,110 @@ func TestFilterSkills(t *testing.T) {
 	}
 }
 
-func TestEnableDisableMovesSkill(t *testing.T) {
+func TestFilterSkillsBySourceText(t *testing.T) {
+	skills := []Skill{
+		{Name: "x", Source: "agents", Description: "x desc", Status: "enabled"},
+		{Name: "y", Source: "claude", Description: "y desc", Status: "enabled"},
+	}
+	result := FilterSkills(skills, "claude", "all", SortByName)
+	if len(result) != 1 || result[0].Source != "claude" {
+		t.Fatalf("expected only claude skill via source-text search, got %#v", result)
+	}
+}
+
+func TestScanAggregatesAcrossSources(t *testing.T) {
 	dir := t.TempDir()
-	root := filepath.Join(dir, "skills")
-	disabled := filepath.Join(dir, "skills-disabled")
+	agentsRoot := filepath.Join(dir, "agents-skills")
+	claudeRoot := filepath.Join(dir, "claude-skills")
+	off := filepath.Join(dir, "off")
 
-	writeSkill(t, root, "demo", "Demo description.")
+	writeSkill(t, agentsRoot, "alpha", "agents alpha")
+	writeSkill(t, claudeRoot, "beta", "claude beta")
+	writeSkill(t, filepath.Join(off, "agents"), "gamma", "disabled agents")
 
-	msg, err := DisableSkill("demo", root, disabled)
+	sources := []Source{
+		{Name: "agents", Root: agentsRoot},
+		{Name: "claude", Root: claudeRoot},
+	}
+	all, err := Scan(sources, off)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if msg != "demo: enabled -> disabled" {
-		t.Errorf("unexpected message: %s", msg)
-	}
-	if _, err := os.Stat(filepath.Join(root, "demo")); !os.IsNotExist(err) {
-		t.Error("demo dir should not exist in live root after disable")
-	}
-	if _, err := os.Stat(filepath.Join(disabled, "demo", "SKILL.md")); err != nil {
-		t.Errorf("SKILL.md should exist in disabled root: %v", err)
+	if len(all) != 3 {
+		t.Fatalf("expected 3 skills, got %d: %#v", len(all), all)
 	}
 
-	msg, err = EnableSkill("demo", root, disabled)
+	bySource := map[string][]string{}
+	for _, s := range all {
+		bySource[s.Source] = append(bySource[s.Source], s.Name+":"+s.Status)
+	}
+	if len(bySource["agents"]) != 2 {
+		t.Errorf("expected 2 agents skills, got %v", bySource["agents"])
+	}
+	if len(bySource["claude"]) != 1 {
+		t.Errorf("expected 1 claude skill, got %v", bySource["claude"])
+	}
+}
+
+func TestScanSameNameInTwoSourcesIsDistinct(t *testing.T) {
+	dir := t.TempDir()
+	agentsRoot := filepath.Join(dir, "agents-skills")
+	claudeRoot := filepath.Join(dir, "claude-skills")
+	off := filepath.Join(dir, "off")
+
+	writeSkill(t, agentsRoot, "shared", "from agents")
+	writeSkill(t, claudeRoot, "shared", "from claude")
+
+	sources := []Source{
+		{Name: "agents", Root: agentsRoot},
+		{Name: "claude", Root: claudeRoot},
+	}
+	all, err := Scan(sources, off)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if msg != "demo: disabled -> enabled" {
-		t.Errorf("unexpected message: %s", msg)
+	if len(all) != 2 {
+		t.Fatalf("expected 2 distinct skills, got %d", len(all))
 	}
-	if _, err := os.Stat(filepath.Join(root, "demo", "SKILL.md")); err != nil {
-		t.Errorf("SKILL.md should exist in live root after enable: %v", err)
+	saw := map[string]bool{}
+	for _, s := range all {
+		saw[s.Source] = true
 	}
-}
-
-func TestEnableSkillNotFound(t *testing.T) {
-	dir := t.TempDir()
-	root := filepath.Join(dir, "skills")
-	disabled := filepath.Join(dir, "skills-disabled")
-
-	_, err := EnableSkill("nonexistent", root, disabled)
-	if err == nil {
-		t.Fatal("expected error for nonexistent skill")
+	if !saw["agents"] || !saw["claude"] {
+		t.Fatalf("expected both sources represented, got %#v", saw)
 	}
 }
 
-func TestDisableProtectedSkill(t *testing.T) {
+func TestScanIncludesLegacyOffRoots(t *testing.T) {
 	dir := t.TempDir()
-	root := filepath.Join(dir, "skills")
-	disabled := filepath.Join(dir, "skills-disabled")
+	agentsRoot := filepath.Join(dir, "agents-skills")
+	off := filepath.Join(dir, "off")
+	legacyOff := filepath.Join(dir, "legacy-off-agents")
 
-	os.MkdirAll(filepath.Join(root, ".system"), 0755)
-	os.WriteFile(filepath.Join(root, ".system", "SKILL.md"), []byte("---\n---\n"), 0644)
+	writeSkill(t, legacyOff, "legacy", "legacy disabled")
 
-	_, err := DisableSkill(".system", root, disabled)
-	if err == nil {
-		t.Fatal("expected error for protected skill")
+	sources := []Source{{Name: "agents", Root: agentsRoot}}
+	all, err := Scan(sources, off, []string{legacyOff})
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestMoveSkillTargetExists(t *testing.T) {
-	dir := t.TempDir()
-	root := filepath.Join(dir, "skills")
-	disabled := filepath.Join(dir, "skills-disabled")
-
-	writeSkill(t, root, "dup", "Some skill.")
-	os.MkdirAll(filepath.Join(disabled, "dup"), 0755)
-	os.WriteFile(filepath.Join(disabled, "dup", "SKILL.md"), []byte("---\n---\n"), 0644)
-
-	_, err := DisableSkill("dup", root, disabled)
-	if err == nil {
-		t.Fatal("expected error for target already existing")
+	if len(all) != 1 {
+		t.Fatalf("expected 1 legacy skill, got %d", len(all))
+	}
+	if all[0].Status != "disabled" || all[0].Name != "legacy" {
+		t.Fatalf("unexpected skill: %#v", all[0])
 	}
 }
 
 func TestPlanAndApplyOperations(t *testing.T) {
 	dir := t.TempDir()
-	root := filepath.Join(dir, "skills")
-	disabled := filepath.Join(dir, "skills-disabled")
+	agentsRoot := filepath.Join(dir, "agents-skills")
+	off := filepath.Join(dir, "off")
 
-	writeSkill(t, root, "toggle-me", "A skill to toggle.")
+	writeSkill(t, agentsRoot, "toggle-me", "A skill to toggle.")
 
-	all, err := Scan(root, disabled)
+	sources := []Source{{Name: "agents", Root: agentsRoot}}
+	all, err := Scan(sources, off)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,50 +268,95 @@ func TestPlanAndApplyOperations(t *testing.T) {
 		t.Fatalf("expected 1 skill, got %d", len(all))
 	}
 
-	ops := PlanOperations(all, root, disabled)
+	roots := map[string]string{"agents": agentsRoot}
+	ops := PlanOperations(all, roots, off)
 	if len(ops) != 1 {
 		t.Fatalf("expected 1 operation, got %d", len(ops))
 	}
 	if ops[0].Direction != "disable" {
 		t.Errorf("expected disable direction, got %s", ops[0].Direction)
 	}
+	if ops[0].Source != "agents" {
+		t.Errorf("expected source agents, got %s", ops[0].Source)
+	}
 
-	err = ApplyOperations(ops)
-	if err != nil {
+	if err := ApplyOperations(ops); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := os.Stat(filepath.Join(root, "toggle-me")); !os.IsNotExist(err) {
-		t.Error("skill should have been moved out of root")
+	if _, err := os.Stat(filepath.Join(agentsRoot, "toggle-me")); !os.IsNotExist(err) {
+		t.Error("skill should have been moved out of agents root")
 	}
-	if _, err := os.Stat(filepath.Join(disabled, "toggle-me", "SKILL.md")); err != nil {
-		t.Error("skill should exist in disabled root")
+	target := filepath.Join(off, "agents", "toggle-me", "SKILL.md")
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("skill should exist at %s: %v", target, err)
 	}
 }
 
-func TestScanIncludesMultipleDisabledRoots(t *testing.T) {
+func TestApplyOperationRefusesProtected(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, "skills")
-	newOff := filepath.Join(dir, "off-new")
-	legacyOff := filepath.Join(dir, "skills-disabled")
+	off := filepath.Join(dir, "off", "agents")
+	os.MkdirAll(filepath.Join(root, ".system"), 0755)
+	os.WriteFile(filepath.Join(root, ".system", "SKILL.md"), []byte("---\n---\n"), 0644)
 
-	writeSkill(t, root, "enabled-skill", "enabled")
-	writeSkill(t, legacyOff, "legacy-off", "legacy")
+	op := Operation{
+		SkillName:  ".system",
+		Source:     "agents",
+		Direction:  "disable",
+		SourcePath: filepath.Join(root, ".system"),
+		TargetPath: filepath.Join(off, ".system"),
+	}
+	if err := ApplyOperation(op); err == nil {
+		t.Fatal("expected protected refusal")
+	}
+}
 
-	all, err := Scan(root, newOff, legacyOff)
+func TestApplyOperationRefusesExistingTarget(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "skills")
+	off := filepath.Join(dir, "off", "agents")
+	writeSkill(t, root, "dup", "original")
+	os.MkdirAll(filepath.Join(off, "dup"), 0755)
+	os.WriteFile(filepath.Join(off, "dup", "SKILL.md"), []byte("---\n---\n"), 0644)
+
+	op := Operation{
+		SkillName:  "dup",
+		Source:     "agents",
+		Direction:  "disable",
+		SourcePath: filepath.Join(root, "dup"),
+		TargetPath: filepath.Join(off, "dup"),
+	}
+	if err := ApplyOperation(op); err == nil {
+		t.Fatal("expected target-exists refusal")
+	}
+}
+
+func TestFindSkillExactSource(t *testing.T) {
+	skills := []Skill{
+		{Name: "shared", Source: "agents", Status: "disabled"},
+		{Name: "shared", Source: "claude", Status: "disabled"},
+		{Name: "uniq", Source: "claude", Status: "enabled"},
+	}
+
+	if _, err := FindSkill(skills, "shared", "", "disabled"); err == nil {
+		t.Fatal("expected ambiguity error for shared without source")
+	}
+
+	got, err := FindSkill(skills, "shared", "agents", "disabled")
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got.Source != "agents" {
+		t.Errorf("expected agents/shared, got %s/%s", got.Source, got.Name)
+	}
 
-	byName := map[string]Skill{}
-	for _, skill := range all {
-		byName[skill.Name] = skill
+	got, err = FindSkill(skills, "uniq", "", "enabled")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if byName["enabled-skill"].Status != "enabled" {
-		t.Fatalf("enabled skill missing or wrong status: %#v", byName["enabled-skill"])
-	}
-	if byName["legacy-off"].Status != "disabled" {
-		t.Fatalf("legacy off skill missing or wrong status: %#v", byName["legacy-off"])
+	if got.Source != "claude" {
+		t.Errorf("expected unique skill, got %s/%s", got.Source, got.Name)
 	}
 }
 
@@ -312,14 +378,14 @@ func TestScanRootSkipsDotFiles(t *testing.T) {
 	os.MkdirAll(filepath.Join(dir, ".hidden"), 0755)
 	os.WriteFile(filepath.Join(dir, ".hidden", "SKILL.md"), []byte("---\n---\n"), 0644)
 
-	skills, err := ScanRoot(dir, "enabled")
+	scanned, err := ScanRoot(dir, "agents", "enabled")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(skills) != 1 {
-		t.Fatalf("expected 1 skill (visible only), got %d", len(skills))
+	if len(scanned) != 1 {
+		t.Fatalf("expected 1 skill (visible only), got %d", len(scanned))
 	}
-	if skills[0].Name != "visible" {
-		t.Errorf("expected 'visible', got '%s'", skills[0].Name)
+	if scanned[0].Name != "visible" || scanned[0].Source != "agents" {
+		t.Errorf("expected visible/agents, got %s/%s", scanned[0].Name, scanned[0].Source)
 	}
 }
