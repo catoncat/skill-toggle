@@ -141,6 +141,26 @@ func TestEnableAmbiguousNameRequiresSource(t *testing.T) {
 	}
 }
 
+func TestUpdateRefusesUnmanagedSkill(t *testing.T) {
+	home := setupHome(t)
+	// install a hand-placed skill (no lockfile entry)
+	writeSkillFile(t, filepath.Join(home, ".agents", "skills"), "handcrafted", "no lock entry")
+
+	cmd := NewRootCommand()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"update", "handcrafted"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected unmanaged update to fail")
+	}
+	if !strings.Contains(err.Error(), "manual update only") {
+		t.Fatalf("expected manual-update message, got %v", err)
+	}
+}
+
 func TestUnknownPositionalArgIsRejected(t *testing.T) {
 	setupHome(t)
 	cmd := NewRootCommand()

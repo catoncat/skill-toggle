@@ -3,6 +3,7 @@ package skills
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -318,7 +319,9 @@ func TestApplyOperationRefusesExistingTarget(t *testing.T) {
 	off := filepath.Join(dir, "off", "agents")
 	writeSkill(t, root, "dup", "original")
 	os.MkdirAll(filepath.Join(off, "dup"), 0755)
-	os.WriteFile(filepath.Join(off, "dup", "SKILL.md"), []byte("---\n---\n"), 0644)
+	// Stale off SKILL.md differs from live source — must refuse to avoid
+	// silent data loss.
+	os.WriteFile(filepath.Join(off, "dup", "SKILL.md"), []byte("---\nname: dup\ndescription: stale\n---\n"), 0644)
 
 	op := Operation{
 		SkillName:  "dup",
@@ -327,8 +330,69 @@ func TestApplyOperationRefusesExistingTarget(t *testing.T) {
 		SourcePath: filepath.Join(root, "dup"),
 		TargetPath: filepath.Join(off, "dup"),
 	}
-	if err := ApplyOperation(op); err == nil {
-		t.Fatal("expected target-exists refusal")
+	err := ApplyOperation(op)
+	if err == nil {
+		t.Fatal("expected refusal when stale off SKILL.md differs from live source")
+	}
+	if !strings.Contains(err.Error(), "differs") {
+		t.Fatalf("expected error to mention SKILL.md diff, got: %v", err)
+	}
+}
+
+func TestApplyOperationReplacesIdenticalStaleOff(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "skills")
+	off := filepath.Join(dir, "off", "agents")
+
+	// writeSkill produces deterministic SKILL.md content, so writing the
+	// same skill into both root and off creates the "identical stale off"
+	// scenario: live and off carry the same content but live should win.
+	writeSkill(t, root, "dup", "shared content")
+	if err := os.MkdirAll(off, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeSkill(t, off, "dup", "shared content")
+
+	op := Operation{
+		SkillName:  "dup",
+		Source:     "agents",
+		Direction:  "disable",
+		SourcePath: filepath.Join(root, "dup"),
+		TargetPath: filepath.Join(off, "dup"),
+	}
+	if err := ApplyOperation(op); err != nil {
+		t.Fatalf("expected stale-off replace to succeed, got: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "dup")); !os.IsNotExist(err) {
+		t.Error("live source should have been moved into off")
+	}
+	if _, err := os.Stat(filepath.Join(off, "dup", "SKILL.md")); err != nil {
+		t.Errorf("off entry should exist after replace: %v", err)
+	}
+}
+
+func TestScanDedupsLiveAgainstStaleOff(t *testing.T) {
+	dir := t.TempDir()
+	codexRoot := filepath.Join(dir, "codex-skills")
+	off := filepath.Join(dir, "off")
+
+	// Live source plus a stale off entry under the same source/name.
+	writeSkill(t, codexRoot, "yansu", "live copy")
+	staleOff := filepath.Join(off, "codex")
+	if err := os.MkdirAll(staleOff, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeSkill(t, staleOff, "yansu", "stale copy")
+
+	all, err := Scan([]Source{{Name: "codex", Root: codexRoot}}, off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("expected stale off entry to be hidden, got %d rows: %#v", len(all), all)
+	}
+	if all[0].Status != "enabled" {
+		t.Fatalf("expected the surviving row to be enabled (live), got %s", all[0].Status)
 	}
 }
 
@@ -369,6 +433,39 @@ func TestHasSkillMD(t *testing.T) {
 	}
 	if HasSkillMD(filepath.Join(dir, "nonexistent")) {
 		t.Error("expected HasSkillMD false for nonexistent dir")
+	}
+}
+
+func TestScanMarksManagedFromLockfile(t *testing.T) {
+	dir := t.TempDir()
+	agentsHome := filepath.Join(dir, ".agents")
+	agentsRoot := filepath.Join(agentsHome, "skills")
+	off := filepath.Join(dir, "off")
+
+	writeSkill(t, agentsRoot, "managed-one", "from skills add")
+	writeSkill(t, agentsRoot, "handcrafted", "manually placed")
+
+	lockBody := `{"version":3,"skills":{"managed-one":{"source":"vercel-labs/agent-skills","sourceType":"github","sourceUrl":"https://github.com/vercel-labs/agent-skills.git","skillPath":"skills/managed-one/SKILL.md","skillFolderHash":"abc"}}}`
+	if err := os.WriteFile(filepath.Join(agentsHome, ".skill-lock.json"), []byte(lockBody), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := Scan([]Source{{Name: "agents", Root: agentsRoot}}, off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]Skill{}
+	for _, s := range all {
+		byName[s.Name] = s
+	}
+	if !byName["managed-one"].Managed {
+		t.Fatalf("managed-one should be Managed=true: %#v", byName["managed-one"])
+	}
+	if byName["managed-one"].LockSource != "vercel-labs/agent-skills" {
+		t.Errorf("expected LockSource set, got %q", byName["managed-one"].LockSource)
+	}
+	if byName["handcrafted"].Managed {
+		t.Fatalf("handcrafted should be Managed=false: %#v", byName["handcrafted"])
 	}
 }
 

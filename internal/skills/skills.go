@@ -1,11 +1,14 @@
 package skills
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/catoncat/skill-toggle/internal/lockfile"
 )
 
 const (
@@ -36,6 +39,14 @@ type Skill struct {
 	// already produced by an earlier entry — i.e. one source root is a
 	// symlink to another (e.g. ~/.claude/skills -> ~/.agents/skills).
 	IsDuplicate bool
+	// Managed is true when this skill appears in the source's
+	// .skill-lock.json — i.e. it was installed by `npx skills add` and
+	// can therefore be updated by `npx skills update`. Hand-placed skill
+	// folders are Managed=false and are not safe to feed to update.
+	Managed bool
+	// LockSource is the upstream `source` field from the lockfile
+	// (e.g. "vercel-labs/agent-skills"), or "" when Managed is false.
+	LockSource string
 }
 
 type Operation struct {
@@ -208,6 +219,16 @@ func Scan(sources []Source, offRoot string, legacyOffPerSource ...[]string) ([]S
 		enabled = append(enabled, scanned...)
 	}
 
+	// A live skill and a stale off entry can coexist (e.g. user disabled a
+	// project skill, then a project sync re-installed the live source). Live
+	// is the active state, so we drop the off duplicate to keep the lists
+	// honest. ApplyOperation will reconcile the stale off folder when the
+	// user disables the live row again.
+	enabledKeys := make(map[string]bool, len(enabled))
+	for _, s := range enabled {
+		enabledKeys[s.Source+"/"+s.Name] = true
+	}
+
 	var disabled []Skill
 	seen := make(map[string]bool)
 	for i, src := range sources {
@@ -225,7 +246,7 @@ func Scan(sources []Source, offRoot string, legacyOffPerSource ...[]string) ([]S
 			}
 			for _, skill := range scanned {
 				key := src.Name + "/" + skill.Name
-				if seen[key] {
+				if seen[key] || enabledKeys[key] {
 					continue
 				}
 				seen[key] = true
@@ -236,7 +257,35 @@ func Scan(sources []Source, offRoot string, legacyOffPerSource ...[]string) ([]S
 
 	result := append(enabled, disabled...)
 	markDuplicates(result)
+	markManaged(result, sources)
 	return result, nil
+}
+
+// markManaged loads each source's .skill-lock.json (if present) and tags
+// any matching scanned skill with Managed=true plus the upstream source.
+// A missing lockfile means nothing in that source was installed via
+// `npx skills add`, so every entry stays Managed=false — safe default.
+func markManaged(skills []Skill, sources []Source) {
+	locks := make(map[string]*lockfile.Lock, len(sources))
+	for _, src := range sources {
+		lock, err := lockfile.Load(lockfile.PathForSourceRoot(src.Root))
+		if err != nil {
+			continue
+		}
+		locks[src.Name] = lock
+	}
+	for i := range skills {
+		lock, ok := locks[skills[i].Source]
+		if !ok {
+			continue
+		}
+		entry, ok := lock.Skills[skills[i].Name]
+		if !ok {
+			continue
+		}
+		skills[i].Managed = true
+		skills[i].LockSource = entry.Source
+	}
 }
 
 func markDuplicates(skills []Skill) {
@@ -324,7 +373,25 @@ func ApplyOperation(op Operation) error {
 	_, errStat := os.Stat(op.TargetPath)
 	_, errLstat := os.Lstat(op.TargetPath)
 	if errStat == nil || errLstat == nil {
-		return fmt.Errorf("target already exists: %s", op.TargetPath)
+		// A target collision on disable usually means a stale off entry from
+		// a previous disable that got re-activated by an external process
+		// (project sync, npx update). The live source is the truth, so if
+		// the two SKILL.md files match we replace the stale off copy. If
+		// they differ we refuse and surface the path so the user can pick.
+		if op.Direction == "disable" {
+			same, cmpErr := sameSkillMD(op.SourcePath, op.TargetPath)
+			if cmpErr != nil {
+				return fmt.Errorf("target already exists at %s and could not be compared: %w", op.TargetPath, cmpErr)
+			}
+			if !same {
+				return fmt.Errorf("target already exists at %s and SKILL.md differs from live source — inspect and remove manually", op.TargetPath)
+			}
+			if err := os.RemoveAll(op.TargetPath); err != nil {
+				return fmt.Errorf("failed to remove stale off entry %s: %w", op.TargetPath, err)
+			}
+		} else {
+			return fmt.Errorf("target already exists: %s", op.TargetPath)
+		}
 	}
 
 	if err := os.Rename(op.SourcePath, op.TargetPath); err != nil {
@@ -332,6 +399,18 @@ func ApplyOperation(op Operation) error {
 	}
 
 	return nil
+}
+
+func sameSkillMD(aDir, bDir string) (bool, error) {
+	a, err := os.ReadFile(filepath.Join(aDir, "SKILL.md"))
+	if err != nil {
+		return false, err
+	}
+	b, err := os.ReadFile(filepath.Join(bDir, "SKILL.md"))
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(a, b), nil
 }
 
 // ApplyOperations applies all operations in order, stopping at the first

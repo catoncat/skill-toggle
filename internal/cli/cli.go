@@ -94,10 +94,10 @@ func runRoot(cmd *cobra.Command, args []string, opts *options) error {
 		return disableSkill(cmd, opts.disableName, opts.source)
 	}
 	if opts.updateName != "" {
-		return runUpdate(cmd, opts.updateName)
+		return runUpdate(cmd, opts.updateName, opts.source)
 	}
 	if opts.updateAll {
-		return runUpdate(cmd, "")
+		return runUpdate(cmd, "", "")
 	}
 	if opts.listFlag || !isTerminal() {
 		return listSkills(cmd, opts)
@@ -155,12 +155,12 @@ func newUpdateCommand(opts *options) *cobra.Command {
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if all {
-				return runUpdate(cmd, "")
+				return runUpdate(cmd, "", "")
 			}
 			if len(args) == 0 {
 				return fmt.Errorf("update requires NAME or --all")
 			}
-			return runUpdate(cmd, args[0])
+			return runUpdate(cmd, args[0], opts.source)
 		},
 	}
 	cmd.Flags().BoolVar(&all, "all", false, "Update all global skills")
@@ -260,8 +260,22 @@ func disableSkill(cmd *cobra.Command, name, source string) error {
 	return nil
 }
 
-func runUpdate(cmd *cobra.Command, name string) error {
-	output, exitCode, err := update.RunSkillsUpdate(name)
+func runUpdate(cmd *cobra.Command, name, source string) error {
+	if name != "" {
+		all, err := scanAll()
+		if err != nil {
+			return err
+		}
+		skill, err := skills.FindSkill(all, name, source, "")
+		if err != nil {
+			return err
+		}
+		if !skill.Managed {
+			return fmt.Errorf("%s/%s is not installed via `npx skills add` — manual update only", skill.Source, skill.Name)
+		}
+		name = skill.Name
+	}
+	output, exitCode, err := update.Run(name)
 	fmt.Fprint(cmd.OutOrStdout(), output)
 	if err != nil {
 		return err
