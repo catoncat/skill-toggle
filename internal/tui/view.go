@@ -12,8 +12,8 @@ import (
 
 // previewBreakpoint is the minimum width at which the right-hand preview
 // panel is shown. Below this, the layout collapses to a single column and
-// the preview is reachable with `p` (full-screen).
-const previewBreakpoint = 100
+// the preview is reachable with `p` / `Enter` / `Tab` (full-screen).
+const previewBreakpoint = 120
 
 // View is the central tea.Model render entry point.
 func (m Model) View() string {
@@ -29,7 +29,7 @@ func (m Model) View() string {
 		return m.renderUpdateScreen()
 	}
 
-	left := m.renderLeftColumn()
+	left := m.renderListPanel(m.leftWidth(), m.leftColumnHeight())
 	var body string
 	if m.showPreviewPane() {
 		body = lipgloss.JoinHorizontal(lipgloss.Top, left, m.renderRightColumn())
@@ -37,13 +37,7 @@ func (m Model) View() string {
 		body = left
 	}
 
-	parts := []string{}
-	if m.mode == modeSearch {
-		parts = append(parts, ui.SearchPrompt(m.query, m.width))
-	}
-	parts = append(parts, body, m.renderBottomStrip())
-
-	view := lipgloss.JoinVertical(lipgloss.Left, parts...)
+	view := lipgloss.JoinVertical(lipgloss.Left, body, m.renderBottomStrip())
 	return m.padToHeight(view)
 }
 
@@ -64,17 +58,21 @@ func (m Model) padToHeight(view string) string {
 	return strings.Join(lines, "\n")
 }
 
-// --- left column: Enabled + Disabled panels stacked vertically ---
+// --- left column: single Skills panel ---
 
 func (m Model) leftWidth() int {
 	if !m.showPreviewPane() {
 		return m.width
 	}
 	min := 48
-	target := m.width * 55 / 100
+	// Preview is auxiliary (skim metadata + first body lines) — give the
+	// list ~65% so long descriptions breathe.
+	target := m.width * 65 / 100
 	if target < min {
 		target = min
 	}
+	// Floor for the right pane so metadata lines (paths, descriptions)
+	// stay legible.
 	if target > m.width-30 {
 		target = m.width - 30
 	}
@@ -97,9 +95,6 @@ func (m Model) rightWidth() int {
 
 func (m Model) leftColumnHeight() int {
 	chrome := 1
-	if m.mode == modeSearch {
-		chrome++
-	}
 	h := m.height - chrome
 	if h < 4 {
 		return 4
@@ -107,50 +102,66 @@ func (m Model) leftColumnHeight() int {
 	return h
 }
 
-func (m Model) renderLeftColumn() string {
-	totalH := m.leftColumnHeight()
-	enabledH := totalH / 2
-	disabledH := totalH - enabledH
-	w := m.leftWidth()
-
-	enabled := m.renderEnabledPanel(w, enabledH)
-	disabled := m.renderDisabledPanel(w, disabledH)
-	return lipgloss.JoinVertical(lipgloss.Left, enabled, disabled)
+func (m Model) renderListPanel(width, height int) string {
+	title := m.listTitle()
+	rowWidth := width - 4
+	nameColW := ui.NameColumnWidth(skillNames(m.visibleList), rowWidth)
+	body := m.renderSkillRows(m.visibleList, m.idx, m.offset, rowWidth, nameColW, true, height-3)
+	return ui.Panel(0, title, body, width, height, true)
 }
 
-func (m Model) renderEnabledPanel(width, height int) string {
-	title := m.panelTitle("Enabled", len(m.enabledList), m.countByStatus("enabled"))
-	body := m.renderSkillRows(m.enabledList, m.enabledIdx, m.enabledOffset, width-4, m.active == panelEnabled, height-3)
-	return ui.Panel(title, body, width, height, m.active == panelEnabled)
+// skillNames adapts a Skill slice into a name slice so the ui package
+// doesn't need to import skills.
+func skillNames(list []skills.Skill) []string {
+	out := make([]string, len(list))
+	for i, s := range list {
+		out[i] = s.Name
+	}
+	return out
 }
 
-func (m Model) renderDisabledPanel(width, height int) string {
-	title := m.panelTitle("Disabled", len(m.disabledList), m.countByStatus("disabled"))
-	body := m.renderSkillRows(m.disabledList, m.disabledIdx, m.disabledOffset, width-4, m.active == panelDisabled, height-3)
-	return ui.Panel(title, body, width, height, m.active == panelDisabled)
-}
-
-// panelTitle builds "<label> (n)" or, when a search query is active,
-// "<label> (matched / total) /<query>" so the user always sees the current
-// filter without having to remember they had typed something.
-func (m Model) panelTitle(label string, shown, total int) string {
+// listTitle builds "Skills · <filter> (n)" or, when a search query is
+// active, "Skills · <filter> (matched / total)  /<query>" so the user
+// always sees both the filter axis and the search axis at a glance.
+func (m Model) listTitle() string {
+	label := "Skills"
+	switch m.statusFilter {
+	case filterEnabled:
+		label = "Skills · enabled"
+	case filterDisabled:
+		label = "Skills · disabled"
+	default:
+		label = "Skills · all"
+	}
+	shown := len(m.visibleList)
 	if m.query == "" {
 		return fmt.Sprintf("%s (%d)", label, shown)
 	}
-	return fmt.Sprintf("%s (%d / %d)  /%s", label, shown, total, m.query)
+	return fmt.Sprintf("%s (%d / %d)  /%s", label, shown, m.countByFilter(), m.query)
 }
 
-func (m Model) countByStatus(status string) int {
+// countByFilter returns how many skills the current statusFilter would
+// surface if the search query were cleared (i.e. the denominator shown in
+// the title's "matched / total" form).
+func (m Model) countByFilter() int {
 	count := 0
 	for _, s := range m.allSkills {
-		if s.Status == status {
-			count++
+		switch m.statusFilter {
+		case filterEnabled:
+			if s.Status != "enabled" {
+				continue
+			}
+		case filterDisabled:
+			if s.Status != "disabled" {
+				continue
+			}
 		}
+		count++
 	}
 	return count
 }
 
-func (m Model) renderSkillRows(list []skills.Skill, idx, offset, rowWidth int, active bool, rows int) string {
+func (m Model) renderSkillRows(list []skills.Skill, idx, offset, rowWidth, nameColW int, active bool, rows int) string {
 	if rows < 1 {
 		rows = 1
 	}
@@ -177,7 +188,7 @@ func (m Model) renderSkillRows(list []skills.Skill, idx, offset, rowWidth int, a
 			s.Name, s.Source, s.Description, s.DescriptionChars,
 			s.Status,
 			i == idx, active, m.isStaged(s),
-			rowWidth,
+			nameColW, rowWidth,
 		)
 		out = append(out, row)
 	}
@@ -193,7 +204,7 @@ func (m Model) renderRightColumn() string {
 	w := m.rightWidth()
 	h := m.leftColumnHeight()
 	body, title := m.previewBody(w - 4)
-	return ui.Panel(title, body, w, h, false)
+	return ui.Panel(3, title, body, w, h, false)
 }
 
 // previewBody returns (body, title) for the preview panel rendered at the
@@ -312,7 +323,7 @@ func (m Model) renderFullPreview() string {
 	if len(allLines) > previewBodyHeight {
 		body += "\n" + ui.MutedText(fmt.Sprintf("Line %d–%d / %d", offset+1, end, len(allLines)))
 	}
-	panel := ui.Panel(title, body, m.width, bodyHeight, true)
+	panel := ui.Panel(3, title, body, m.width, bodyHeight, true)
 	return panel + "\n" + m.renderBottomStrip()
 }
 
@@ -325,6 +336,9 @@ func (m Model) renderBottomStrip() string {
 	}
 	if m.pendingConfirm != confirmNone {
 		return m.renderConfirmStrip(width)
+	}
+	if m.mode == modeSearch {
+		return ui.SearchPrompt(m.query, width)
 	}
 	hints := keyStripHints(m)
 	rendered := make([]string, 0, len(hints))
@@ -386,17 +400,7 @@ func (m Model) renderStatusSegment() string {
 			out = staging
 		}
 	}
-	if out == "" {
-		out = ui.MutedText(fmt.Sprintf("%s · sort=%s", m.activeSummary(), shortSortLabel(m.sortMode)))
-	}
 	return out
-}
-
-func (m Model) activeSummary() string {
-	if m.active == panelDisabled {
-		return "Disabled focus"
-	}
-	return "Enabled focus"
 }
 
 func shortSortLabel(s string) string {
@@ -460,7 +464,7 @@ func (m Model) renderUpdateScreen() string {
 
 	visible := m.updateVisibleLines(innerHeight, innerWidth)
 	body := strings.Join(visible, "\n")
-	panel := ui.Panel(title, body, m.width, panelHeight, true)
+	panel := ui.Panel(0, title, body, m.width, panelHeight, true)
 
 	footer := m.renderUpdateFooter()
 	return panel + "\n" + footer
@@ -589,42 +593,161 @@ func (m Model) renderHelpScreen() string {
 	return strings.Join(canvas, "\n")
 }
 
+// renderHelpBox builds the help overlay. Single-column would not fit a
+// 24-row terminal (the four groups + headers run ~30 lines), so blocks are
+// greedy-packed into the smallest column count whose tallest column still
+// fits the terminal. The box outer width also snaps to the laid-out content
+// width — a 250-col terminal no longer gets a 167-col help box.
 func (m Model) renderHelpBox() string {
 	entries := helpEntries()
-	groups := []string{}
-	groupBody := map[string][]string{}
+	groupOrder := []string{}
+	groupRows := map[string][]string{}
 	for _, e := range entries {
-		if _, ok := groupBody[e.Group]; !ok {
-			groups = append(groups, e.Group)
+		if _, ok := groupRows[e.Group]; !ok {
+			groupOrder = append(groupOrder, e.Group)
 		}
-		groupBody[e.Group] = append(groupBody[e.Group], fmt.Sprintf("  %-18s %s", e.Key, e.Label))
+		groupRows[e.Group] = append(groupRows[e.Group], fmt.Sprintf("  %-15s %s", e.Key, e.Label))
 	}
-	var lines []string
-	lines = append(lines, lipgloss.NewStyle().Foreground(ui.Accent).Bold(true).Render("skill-toggle keys"))
-	lines = append(lines, "")
-	for _, g := range groups {
-		lines = append(lines, lipgloss.NewStyle().Bold(true).Render(g))
-		lines = append(lines, groupBody[g]...)
-		lines = append(lines, "")
+
+	titleLine := lipgloss.NewStyle().Foreground(ui.Accent).Bold(true).Render("skill-toggle keys")
+	footerLine := ui.MutedText("press any key to dismiss")
+
+	blocks := make([][]string, 0, len(groupOrder))
+	blockW := 0
+	for _, g := range groupOrder {
+		b := []string{lipgloss.NewStyle().Bold(true).Render(g)}
+		b = append(b, groupRows[g]...)
+		blocks = append(blocks, b)
+		for _, l := range b {
+			if w := lipgloss.Width(l); w > blockW {
+				blockW = w
+			}
+		}
 	}
-	lines = append(lines, ui.MutedText("press any key to dismiss"))
-	width := m.width * 2 / 3
-	if width < 50 {
-		width = 50
+
+	const (
+		gutter       = 4 // spacing between columns
+		boxBorderW   = 2 // rounded border (left + right)
+		boxPaddingW  = 4 // HelpOverlayBox padding (1, 2)
+		boxBorderH   = 2
+		boxPaddingH  = 2
+		extraHChrome = 4 // title + spacer + spacer + footer
+	)
+
+	availH := m.height - boxBorderH - boxPaddingH - extraHChrome
+	if availH < 4 {
+		availH = 4
 	}
-	if width > m.width-4 {
-		width = m.width - 4
+
+	maxBoxOuterW := m.width
+	if maxBoxOuterW < blockW+boxBorderW+boxPaddingW {
+		maxBoxOuterW = blockW + boxBorderW + boxPaddingW
 	}
-	return ui.HelpOverlayBox(strings.Join(lines, "\n"), width)
+	maxInnerW := maxBoxOuterW - boxBorderW - boxPaddingW
+	if maxInnerW < blockW {
+		maxInnerW = blockW
+	}
+
+	maxCols := (maxInnerW + gutter) / (blockW + gutter)
+	if maxCols < 1 {
+		maxCols = 1
+	}
+	if maxCols > len(blocks) {
+		maxCols = len(blocks)
+	}
+
+	columns := packHelpBlocksIntoColumns(blocks, availH, maxCols)
+
+	rendered := make([]string, len(columns))
+	for i, c := range columns {
+		rendered[i] = strings.Join(c, "\n")
+	}
+	var body string
+	if len(rendered) == 1 {
+		body = rendered[0]
+	} else {
+		cells := make([]string, 0, 2*len(rendered)-1)
+		for i, r := range rendered {
+			if i > 0 {
+				cells = append(cells, strings.Repeat(" ", gutter))
+			}
+			cells = append(cells, r)
+		}
+		body = lipgloss.JoinHorizontal(lipgloss.Top, cells...)
+	}
+
+	bodyW := lipgloss.Width(body)
+	contentW := bodyW
+	if w := lipgloss.Width(titleLine); w > contentW {
+		contentW = w
+	}
+	if w := lipgloss.Width(footerLine); w > contentW {
+		contentW = w
+	}
+
+	boxOuterW := contentW + boxBorderW + boxPaddingW
+	if boxOuterW > maxBoxOuterW {
+		boxOuterW = maxBoxOuterW
+	}
+
+	full := titleLine + "\n\n" + body + "\n\n" + footerLine
+	return ui.HelpOverlayBox(full, boxOuterW)
+}
+
+// packHelpBlocksIntoColumns greedily distributes blocks into N columns,
+// trying N=1..maxCols, returning the smallest N where the tallest column is
+// ≤ availH. If even maxCols overflows, packs into maxCols and lets the box
+// be tall (caller may still truncate, but at least the layout is balanced).
+func packHelpBlocksIntoColumns(blocks [][]string, availH, maxCols int) [][]string {
+	for n := 1; n <= maxCols; n++ {
+		if cols, ok := tryPackHelpColumns(blocks, n, availH); ok {
+			return cols
+		}
+	}
+	cols, _ := tryPackHelpColumns(blocks, maxCols, 1<<30)
+	return cols
+}
+
+func tryPackHelpColumns(blocks [][]string, n, maxColH int) ([][]string, bool) {
+	if n < 1 {
+		n = 1
+	}
+	cols := make([][]string, 0, n)
+	cur := []string{}
+	curH := 0
+	for _, b := range blocks {
+		addH := len(b)
+		if curH > 0 {
+			addH++ // spacer line between blocks in the same column
+		}
+		if curH > 0 && curH+addH > maxColH {
+			cols = append(cols, cur)
+			if len(cols) >= n {
+				return nil, false
+			}
+			cur = []string{}
+			curH = 0
+			addH = len(b)
+		}
+		if curH > 0 {
+			cur = append(cur, "")
+		}
+		cur = append(cur, b...)
+		curH = len(cur)
+	}
+	if len(cur) > 0 {
+		if len(cols) >= n {
+			return nil, false
+		}
+		cols = append(cols, cur)
+	}
+	return cols, true
 }
 
 // previewBodyHeight returns how many body rows the right panel can render
 // when normal layout is in effect (used by full preview key handling).
 func (m Model) previewBodyHeight() int {
 	chrome := 1
-	if m.mode == modeSearch {
-		chrome++
-	}
 	avail := m.height - chrome - 3 // panel border + title rows
 	if m.mode == modePreviewFull {
 		avail = m.height - 1 - 3

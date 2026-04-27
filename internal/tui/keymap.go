@@ -11,30 +11,30 @@ func helpEntries() []helpEntry {
 	return []helpEntry{
 		{"Navigation", "j / ↓", "cursor down"},
 		{"Navigation", "k / ↑", "cursor up"},
-		{"Navigation", "g", "top of panel"},
-		{"Navigation", "G", "bottom of panel"},
+		{"Navigation", "g", "top of list"},
+		{"Navigation", "G", "bottom of list"},
 		{"Navigation", "ctrl+d", "half page down"},
 		{"Navigation", "ctrl+u", "half page up"},
-		{"Navigation", "tab / shift+tab", "switch panel"},
-		{"Navigation", "H", "focus Enabled panel"},
-		{"Navigation", "L", "focus Disabled panel"},
+
+		{"Filter", "a", "show all"},
+		{"Filter", "e", "show enabled only"},
+		{"Filter", "d", "show disabled only"},
+		{"Filter", "/", "search"},
+		{"Filter", "esc", "clear search"},
+		{"Filter", ".", "toggle symlinks"},
+		{"Filter", "s", "cycle sort"},
 
 		{"Skill", "space", "stage / unstage"},
 		{"Skill", "A", "apply staged ops"},
-		{"Skill", "C", "clear all staged ops"},
-		{"Skill", "p / enter", "full-screen preview"},
-		{"Skill", "u", "update current enabled skill"},
-		{"Skill", "U", "update all global skills"},
-		{"Skill", "r", "rescan filesystem"},
+		{"Skill", "C", "clear staged"},
+		{"Skill", "p / enter / tab", "open preview"},
+		{"Skill", "u", "update skill"},
+		{"Skill", "U", "update all"},
+		{"Skill", "r", "rescan disk"},
 
-		{"View", "/", "search (clears with esc)"},
-		{"View", "esc", "clear search filter"},
-		{"View", ".", "toggle symlink markers"},
-		{"View", "s", "cycle sort"},
 		{"View", "?", "toggle help"},
-
-		{"Quit", "q", "quit (confirm if staged)"},
-		{"Quit", "ctrl+c", "hard quit"},
+		{"View", "q", "quit"},
+		{"View", "ctrl+c", "hard quit"},
 	}
 }
 
@@ -52,7 +52,7 @@ func keyStripHints(m Model) []hintPair {
 		return []hintPair{
 			{"j/k", "scroll"},
 			{"g/G", "top/bot"},
-			{"esc/p/q", "back"},
+			{"esc/p/tab", "back"},
 		}
 	case m.pendingConfirm != confirmNone:
 		return []hintPair{
@@ -61,7 +61,7 @@ func keyStripHints(m Model) []hintPair {
 		}
 	default:
 		return []hintPair{
-			{"tab", "switch"},
+			{"a/e/d", "filter"},
 			{"j/k", "move"},
 			{"space", "stage"},
 			{"A", "apply"},

@@ -176,27 +176,25 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) handleNormalKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key.Type {
-	case tea.KeyTab:
-		return m.swapPanel(true), nil
-	case tea.KeyShiftTab:
-		return m.swapPanel(false), nil
+	case tea.KeyTab, tea.KeyShiftTab:
+		return m.openPreviewFull()
 	case tea.KeyUp:
 		return m.moveCursor(-1), nil
 	case tea.KeyDown:
 		return m.moveCursor(1), nil
 	case tea.KeyPgUp:
-		return m.moveCursorBy(-m.activePageSize()), nil
+		return m.moveCursorBy(-m.listPageSize()), nil
 	case tea.KeyPgDown:
-		return m.moveCursorBy(m.activePageSize()), nil
+		return m.moveCursorBy(m.listPageSize()), nil
 	case tea.KeySpace:
 		m.stageCurrent()
 		return m, nil
 	case tea.KeyEnter:
 		return m.openPreviewFull()
 	case tea.KeyCtrlD:
-		return m.moveCursorBy(m.activePageSize() / 2), nil
+		return m.moveCursorBy(m.listPageSize() / 2), nil
 	case tea.KeyCtrlU:
-		return m.moveCursorBy(-m.activePageSize() / 2), nil
+		return m.moveCursorBy(-m.listPageSize() / 2), nil
 	case tea.KeyEsc:
 		// Esc clears the active filter first, then status messages, so the
 		// user has a fast path back from any "stuck" state without having
@@ -204,7 +202,7 @@ func (m Model) handleNormalKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.query != "" {
 			m.query = ""
 			m.refreshLists()
-			m.message = "filter cleared"
+			m.message = "search cleared"
 			m.messageType = "info"
 			return m, nil
 		}
@@ -227,14 +225,12 @@ func (m Model) handleNormalKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.cursorToEdge(true), nil
 	case "G":
 		return m.cursorToEdge(false), nil
-	case "H":
-		m.active = panelEnabled
-		m.clampSelection()
-		return m, nil
-	case "L":
-		m.active = panelDisabled
-		m.clampSelection()
-		return m, nil
+	case "a":
+		return m.setFilter(filterAll), nil
+	case "e":
+		return m.setFilter(filterEnabled), nil
+	case "d":
+		return m.setFilter(filterDisabled), nil
 	case "/":
 		m.mode = modeSearch
 		return m, nil
@@ -245,6 +241,8 @@ func (m Model) handleNormalKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "s":
 		m.cycleSort()
+		m.message = "sort: " + shortSortLabel(m.sortMode)
+		m.messageType = "info"
 		return m, nil
 	case "r":
 		m.message = "rescanning…"
@@ -257,6 +255,11 @@ func (m Model) handleNormalKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if s.Status != "enabled" {
 			m.message = fmt.Sprintf("cannot update disabled skill: %s/%s", s.Source, s.Name)
+			m.messageType = "error"
+			return m, nil
+		}
+		if !s.Managed {
+			m.message = fmt.Sprintf("%s/%s not installed via `npx skills add` — manual update only", s.Source, s.Name)
 			m.messageType = "error"
 			return m, nil
 		}
@@ -336,7 +339,7 @@ func (m Model) handlePreviewKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch key.Type {
-	case tea.KeyEsc:
+	case tea.KeyEsc, tea.KeyTab, tea.KeyShiftTab:
 		return m.closePreviewFull(), nil
 	case tea.KeyDown:
 		if m.previewOffset < maxOffset {
@@ -604,18 +607,7 @@ func (m Model) applyAllStaged() (tea.Model, tea.Cmd) {
 	return m, scanSkillsCmd(m)
 }
 
-// --- panel/cursor mutation helpers ---
-
-func (m Model) swapPanel(forward bool) Model {
-	if m.active == panelEnabled {
-		m.active = panelDisabled
-	} else {
-		m.active = panelEnabled
-	}
-	_ = forward
-	m.clampSelection()
-	return m
-}
+// --- cursor mutation helpers ---
 
 func (m Model) moveCursor(delta int) Model {
 	return m.moveCursorBy(delta)
@@ -625,50 +617,57 @@ func (m Model) moveCursorBy(delta int) Model {
 	if delta == 0 {
 		return m
 	}
-	idx := m.currentIdx() + delta
-	listSize := len(m.currentList())
+	listSize := len(m.visibleList)
 	if listSize == 0 {
 		return m
 	}
+	idx := m.idx + delta
 	if idx < 0 {
 		idx = 0
 	}
 	if idx >= listSize {
 		idx = listSize - 1
 	}
-	if m.active == panelDisabled {
-		m.disabledIdx = idx
-	} else {
-		m.enabledIdx = idx
-	}
+	m.idx = idx
 	m.clampSelection()
 	return m
 }
 
 func (m Model) cursorToEdge(top bool) Model {
-	listSize := len(m.currentList())
+	listSize := len(m.visibleList)
 	if listSize == 0 {
 		return m
 	}
-	target := 0
-	if !top {
-		target = listSize - 1
-	}
-	if m.active == panelDisabled {
-		m.disabledIdx = target
+	if top {
+		m.idx = 0
 	} else {
-		m.enabledIdx = target
+		m.idx = listSize - 1
 	}
 	m.clampSelection()
 	return m
 }
 
-func (m Model) activePageSize() int {
-	enabled, disabled := m.panelBodyHeights()
-	if m.active == panelDisabled {
-		return disabled
+func (m Model) listPageSize() int { return m.listBodyHeight() }
+
+// setFilter switches the status-filter axis, preserving the cursor's
+// underlying skill when possible so the view doesn't jump unexpectedly.
+func (m Model) setFilter(f string) Model {
+	if m.statusFilter == f {
+		return m
 	}
-	return enabled
+	prev := m.currentSkill()
+	m.statusFilter = f
+	m.refreshLists()
+	if prev != nil {
+		for i, s := range m.visibleList {
+			if s.Source == prev.Source && s.Name == prev.Name {
+				m.idx = i
+				m.clampSelection()
+				break
+			}
+		}
+	}
+	return m
 }
 
 func (m *Model) cycleSort() {

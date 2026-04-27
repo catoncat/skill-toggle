@@ -6,14 +6,6 @@ import (
 	"github.com/catoncat/skill-toggle/internal/update"
 )
 
-// panel identifies which side of the left column has focus.
-type panel string
-
-const (
-	panelEnabled  panel = "enabled"
-	panelDisabled panel = "disabled"
-)
-
 // mode is the dominant top-level mode of the TUI.
 type mode string
 
@@ -23,6 +15,14 @@ const (
 	modePreviewFull mode = "preview"
 	modeHelp        mode = "help"
 	modeUpdate      mode = "update"
+)
+
+// Status filter values. The filter is the user-visible "axis" that the
+// list is sliced along (a/e/d keys), orthogonal to the search query.
+const (
+	filterAll      = "all"
+	filterEnabled  = "enabled"
+	filterDisabled = "disabled"
 )
 
 // confirmKind tracks an inline y/N prompt while still in normal mode.
@@ -47,21 +47,17 @@ type Model struct {
 	// All scanned skills (raw, unfiltered).
 	allSkills []skills.Skill
 
-	// Filtered + sorted partitions, refreshed when allSkills/query/sort change.
-	enabledList  []skills.Skill
-	disabledList []skills.Skill
+	// Single visible list — refreshed when allSkills/query/filter/sort change.
+	visibleList []skills.Skill
 
-	// Panel cursors. enabledIdx/Offset and disabledIdx/Offset advance
-	// independently so toggling Tab doesn't reset position.
-	active         panel
-	enabledIdx     int
-	enabledOffset  int
-	disabledIdx    int
-	disabledOffset int
+	// Cursor + viewport offset for the single list.
+	idx    int
+	offset int
 
 	// Filter / sort.
-	query    string
-	sortMode string
+	query        string
+	statusFilter string
+	sortMode     string
 
 	// Staged operations awaiting `A`.
 	stagedOps []skills.Operation
@@ -105,44 +101,29 @@ type Model struct {
 // individual fields after construction in tests; see TUI tests.
 func NewModel() Model {
 	return Model{
-		sources:     config.Sources(),
-		sourceRoots: config.SourceRootMap(),
-		offRoot:     config.OffRoot(),
-		legacyOff:   config.LegacyOffPerSource(),
-		active:      panelEnabled,
-		mode:        modeNormal,
-		sortMode:    skills.SortByName,
+		sources:      config.Sources(),
+		sourceRoots:  config.SourceRootMap(),
+		offRoot:      config.OffRoot(),
+		legacyOff:    config.LegacyOffPerSource(),
+		mode:         modeNormal,
+		sortMode:     skills.SortByName,
+		statusFilter: filterAll,
 	}
 }
 
-// activePanel returns the model's active panel as an enum value.
-func (m Model) activePanel() panel { return m.active }
+// currentList returns the visible list slice.
+func (m Model) currentList() []skills.Skill { return m.visibleList }
 
-// currentList returns the slice the active panel is showing.
-func (m Model) currentList() []skills.Skill {
-	if m.active == panelDisabled {
-		return m.disabledList
-	}
-	return m.enabledList
-}
+// currentIdx returns the cursor index in the visible list.
+func (m Model) currentIdx() int { return m.idx }
 
-// currentIdx returns the cursor index within the active panel.
-func (m Model) currentIdx() int {
-	if m.active == panelDisabled {
-		return m.disabledIdx
-	}
-	return m.enabledIdx
-}
-
-// currentSkill returns a pointer to the skill under the active cursor, or
-// nil when the active panel is empty.
+// currentSkill returns a pointer to the skill under the cursor, or nil when
+// the visible list is empty.
 func (m Model) currentSkill() *skills.Skill {
-	list := m.currentList()
-	idx := m.currentIdx()
-	if idx < 0 || idx >= len(list) {
+	if m.idx < 0 || m.idx >= len(m.visibleList) {
 		return nil
 	}
-	s := list[idx]
+	s := m.visibleList[m.idx]
 	return &s
 }
 
@@ -168,8 +149,8 @@ func (m Model) stageCounts() (enable int, disable int) {
 	return
 }
 
-// refreshLists rebuilds enabledList and disabledList from allSkills using
-// the current query, sort mode and showLinked flag, then clamps cursors.
+// refreshLists rebuilds visibleList from allSkills using the current query,
+// filter, sort mode and showLinked flag, then clamps the cursor.
 func (m *Model) refreshLists() {
 	base := m.allSkills
 	if !m.showLinked {
@@ -182,74 +163,56 @@ func (m *Model) refreshLists() {
 		}
 		base = filtered
 	}
-	all := skills.FilterSkills(base, m.query, "all", m.sortMode)
-	m.enabledList = m.enabledList[:0]
-	m.disabledList = m.disabledList[:0]
-	for _, s := range all {
-		if s.Status == "enabled" {
-			m.enabledList = append(m.enabledList, s)
-		} else {
-			m.disabledList = append(m.disabledList, s)
-		}
-	}
+	m.visibleList = skills.FilterSkills(base, m.query, m.statusFilter, m.sortMode)
 	m.clampSelection()
 }
 
-// clampSelection keeps the cursor and scroll offset in range for both panels.
+// clampSelection keeps the cursor and scroll offset in range.
 func (m *Model) clampSelection() {
-	enabledHeight, disabledHeight := m.panelBodyHeights()
-	clampOne := func(idx, offset, size, height int) (int, int) {
-		if size == 0 {
-			return 0, 0
-		}
-		if idx < 0 {
-			idx = 0
-		}
-		if idx >= size {
-			idx = size - 1
-		}
-		if height < 1 {
-			height = 1
-		}
-		if idx < offset {
-			offset = idx
-		}
-		if idx >= offset+height {
-			offset = idx - height + 1
-		}
-		if offset < 0 {
-			offset = 0
-		}
-		return idx, offset
+	size := len(m.visibleList)
+	if size == 0 {
+		m.idx = 0
+		m.offset = 0
+		return
 	}
-	m.enabledIdx, m.enabledOffset = clampOne(m.enabledIdx, m.enabledOffset, len(m.enabledList), enabledHeight)
-	m.disabledIdx, m.disabledOffset = clampOne(m.disabledIdx, m.disabledOffset, len(m.disabledList), disabledHeight)
+	if m.idx < 0 {
+		m.idx = 0
+	}
+	if m.idx >= size {
+		m.idx = size - 1
+	}
+	height := m.listBodyHeight()
+	if height < 1 {
+		height = 1
+	}
+	if m.idx < m.offset {
+		m.offset = m.idx
+	}
+	if m.idx >= m.offset+height {
+		m.offset = m.idx - height + 1
+	}
+	if m.offset < 0 {
+		m.offset = 0
+	}
 }
 
-// panelBodyHeights returns the renderable rows for each left-side panel,
+// listBodyHeight returns the renderable rows for the single skill panel,
 // based on terminal height and the current mode.
-func (m Model) panelBodyHeights() (enabled int, disabled int) {
+func (m Model) listBodyHeight() int {
 	// Reserved chrome:
-	//   1 line — bottom key strip
-	//   1 line — search prompt when search mode is active
+	//   1 line — bottom key strip / search prompt
 	chromeRows := 1
 	if m.mode == modeSearch {
 		chromeRows++
 	}
 	available := m.height - chromeRows
 	if available < 4 {
-		return 1, 1
+		return 1
 	}
-	enabledOuter := available / 2
-	disabledOuter := available - enabledOuter
-	// Each panel uses 2 rows of border + 1 row of title -> 3 rows of chrome.
-	enabledBody := enabledOuter - 3
-	disabledBody := disabledOuter - 3
-	if enabledBody < 1 {
-		enabledBody = 1
+	// Panel uses 2 rows of border + 1 row of title -> 3 rows of chrome.
+	body := available - 3
+	if body < 1 {
+		return 1
 	}
-	if disabledBody < 1 {
-		disabledBody = 1
-	}
-	return enabledBody, disabledBody
+	return body
 }

@@ -7,7 +7,7 @@ It aggregates skills from `~/.agents/skills`, `~/.claude/skills`, and `~/.codex/
 ## What It Does
 
 - Aggregates skills across all three live roots — no profile to pick.
-- Lazygit-style TUI: Enabled and Disabled panels stacked on the left, SKILL.md preview on the right.
+- Lazygit-style TUI: a single skill list on the left filterable by `a` (all) / `e` (enabled) / `d` (disabled), with a SKILL.md preview on the right.
 - Stages toggles with `Space` and applies them in one batch with `A`. Files don't move until you commit.
 - Searches by name, source, or description.
 - Sorts by name, description size descending, or description size ascending.
@@ -42,17 +42,16 @@ skill-toggle
 Useful keys:
 
 ```text
-tab / shift+tab    switch panel (Enabled ↔ Disabled)
-H / L              focus Enabled / Disabled panel
-j/k or ↑/↓         move cursor in active panel
-g / G              top / bottom of active panel
+a / e / d          filter list (all / enabled-only / disabled-only)
+j/k or ↑/↓         move cursor
+g / G              top / bottom of list
 ctrl+d / ctrl+u    half page down / up
 space              stage / unstage current skill
 A                  apply all staged operations
 C                  clear all staged operations
-p / enter          full-screen SKILL.md preview
+p / enter / tab    full-screen SKILL.md preview (toggle)
 /                  search (matches name, source, description)
-esc                clear active filter / dismiss message
+esc                clear search / dismiss message
 .                  toggle symlinked-duplicate rows
 s                  cycle sort (name → size↓ → size↑)
 u                  update current enabled skill (live progress overlay)
@@ -89,6 +88,21 @@ skill-toggle update --all
 ### Symlinked source roots
 
 If `~/.claude/skills` is a symlink to `~/.agents/skills` (a common setup), every skill would otherwise show up twice — once per source. By default the tool resolves canonical paths and hides the duplicates, anchoring on the earliest source listed (agents → claude → codex). Pass `--show-linked` (CLI) or press `.` (TUI) to see every source's row.
+
+### Managed vs hand-placed skills
+
+`npx skills update` only knows how to refresh skills it installed itself. The
+authoritative marker is `~/.<source>/.skill-lock.json` — anything listed
+under `skills.<name>` in that file was added via `npx skills add`. Hand-placed
+SKILL.md folders (e.g. ones you wrote or copied from another machine) won't
+be in the lockfile and therefore can't be updated by the tool.
+
+`skill-toggle` reads each source's lockfile during the scan and tags every
+skill with a `Managed` flag. The `u` key in the TUI and `skill-toggle update
+NAME` on the CLI both refuse to act on unmanaged skills with a `manual
+update only` message. The bulk path (`U` / `skill-toggle update --all`)
+delegates to `npx skills update -g` directly — vercel-labs/skills will only
+touch its own managed entries there, so it's safe to use either way.
 
 ## Filesystem Model
 

@@ -24,8 +24,9 @@ var (
 )
 
 // Panel renders a bordered region. width and height count the OUTER size
-// (border-inclusive). Pass active=true to highlight the border.
-func Panel(title string, body string, width, height int, active bool) string {
+// (border-inclusive). Pass active=true to highlight the border. number is the
+// 1-based panel id rendered as a `[N]` prefix to the title; pass 0 to omit.
+func Panel(number int, title string, body string, width, height int, active bool) string {
 	border := Border
 	if active {
 		border = BorderActive
@@ -55,7 +56,7 @@ func Panel(title string, body string, width, height int, active bool) string {
 		contentHeight = 1
 	}
 
-	titleStyled := PanelTitle(title, active, contentWidth)
+	titleStyled := PanelTitle(number, title, active, contentWidth)
 	bodyHeight := contentHeight - 1
 	if bodyHeight < 0 {
 		bodyHeight = 0
@@ -77,18 +78,30 @@ func Panel(title string, body string, width, height int, active bool) string {
 	return style.Width(frameW).Height(frameH).Render(content)
 }
 
-// PanelTitle renders a panel title line. When active, the title gets the
-// accent color and a small marker so the user can find it without reading
-// border colors only.
-func PanelTitle(title string, active bool, width int) string {
-	prefix := "  "
-	color := Muted
+// PanelTitle renders a panel title line. When number > 0 the title is
+// prefixed with `[N] ` (lazygit-style); the bracketed number is highlighted
+// in Accent on the active panel and Muted on inactive panels so the focused
+// panel is identifiable without reading border colors. The title text itself
+// is bold + Accent on active, default color on inactive.
+func PanelTitle(number int, title string, active bool, width int) string {
+	titleColor := Muted
 	if active {
-		prefix = "● "
-		color = Accent
+		titleColor = Accent
 	}
-	titleStyle := lipgloss.NewStyle().Foreground(color).Bold(active)
-	rendered := titleStyle.Render(prefix + title)
+	titleStyle := lipgloss.NewStyle().Foreground(titleColor).Bold(active)
+
+	var rendered string
+	if number > 0 {
+		numColor := Muted
+		if active {
+			numColor = Accent
+		}
+		numStyle := lipgloss.NewStyle().Foreground(numColor).Bold(true)
+		rendered = numStyle.Render(fmt.Sprintf("[%d] ", number)) + titleStyle.Render(title)
+	} else {
+		rendered = titleStyle.Render("  " + title)
+	}
+
 	pad := width - lipgloss.Width(rendered)
 	if pad > 0 {
 		rendered += strings.Repeat(" ", pad)
@@ -98,9 +111,53 @@ func PanelTitle(title string, active bool, width int) string {
 	return rendered
 }
 
+// NameColumnWidth picks a panel-wide name column width using the standard
+// two-pass approach: scan all rows for max(name width), clamp into
+// [nameMin, cap]. The cap is min(28, half the budget left after the
+// fixed columns) so a runaway long skill name can't starve description.
+//
+// Pass the result to every SkillRow rendered for that panel so source /
+// chars / description columns line up across rows.
+func NameColumnWidth(names []string, width int) int {
+	const (
+		fixedWithDesc = 18
+		nameMin       = 12
+		nameMaxAbs    = 28
+	)
+	budget := (width - fixedWithDesc) / 2
+	if budget < 1 {
+		budget = 1
+	}
+	cap := nameMaxAbs
+	if cap > budget {
+		cap = budget
+	}
+	if cap < nameMin {
+		cap = nameMin
+	}
+
+	maxName := 0
+	for _, n := range names {
+		if w := lipgloss.Width(n); w > maxName {
+			maxName = w
+		}
+	}
+	if maxName < nameMin {
+		maxName = nameMin
+	}
+	if maxName > cap {
+		maxName = cap
+	}
+	return maxName
+}
+
 // SkillRow formats a single row in the Enabled/Disabled list.
 //
 // width       = total cell width
+// nameColW    = pre-computed column width for the name field (caller is
+//               expected to compute this once per render with the panel's
+//               max name width — see NameColumnWidth — so all rows in the
+//               panel share the same source/chars/desc column starts)
 // selected    = cursor sits on this row in the panel
 // activePanel = whether the panel containing this row currently has focus
 // staged      = the row is staged for toggling
@@ -108,19 +165,15 @@ func PanelTitle(title string, active bool, width int) string {
 // Layout (visible columns):
 //
 //	<staged><cursor><name>SP<source>SP<chars>[SP<description>]
-//	  1       2      N    1   7     1   5     1   M
+//	  1       2     nameColW 1   7     1   5     1   M
 //
 // Status (ON/OFF) is conveyed by panel placement plus name color: enabled
 // rows leave the foreground unset (terminal default — adapts to dark/light
 // themes without relying on Lip Gloss adaptive color), disabled rows use
-// Muted. The column algorithm gives name the room it needs first, then
-// hands the rest to description; description is dropped when there's less
-// than 6 visible columns left so a 1-2 char trailing description doesn't
-// look like garbage. Total visible width is held to exactly `width` so the
-// outer Panel never has to re-trim a styled string (which would risk
-// cutting an ANSI escape sequence in half and producing replacement glyphs
-// like `◇` / `�`).
-func SkillRow(name, source, description string, descChars int, status string, selected, activePanel, staged bool, width int) string {
+// Muted. Total visible width is held to exactly `width` so the outer
+// Panel never has to re-trim a styled string (which would risk cutting an
+// ANSI escape sequence in half and producing replacement glyphs like `◇`).
+func SkillRow(name, source, description string, descChars int, status string, selected, activePanel, staged bool, nameColW, width int) string {
 	if width < 10 {
 		return TrimToWidth(name, width)
 	}
@@ -138,31 +191,28 @@ func SkillRow(name, source, description string, descChars int, status string, se
 	}
 
 	const (
-		stagedW    = 1
-		cursorW    = 2
-		sourceW    = 7
-		charsW     = 5
-		nameMin    = 4
-		descMin    = 6
+		stagedW       = 1
+		cursorW       = 2
+		sourceW       = 7
+		charsW        = 5
+		nameFloor     = 4
+		descMin       = 6
 		fixedNoDesc   = stagedW + cursorW + 1 + sourceW + 1 + charsW // 17
 		fixedWithDesc = fixedNoDesc + 1                              // 18 (desc spacer)
 	)
 
-	nameWant := lipgloss.Width(name)
+	// Cap nameColW so the row can never exceed the cell width: nameW must
+	// fit within (width - fixedNoDesc) at minimum.
+	nameW := nameColW
+	if maxNameW := width - fixedNoDesc; nameW > maxNameW {
+		nameW = maxNameW
+	}
+	if nameW < nameFloor {
+		nameW = nameFloor
+	}
 
-	var nameW, descW int
-	switch {
-	case width-fixedWithDesc-nameWant >= descMin:
-		nameW = nameWant
-		descW = width - fixedWithDesc - nameW
-	case width-fixedNoDesc >= nameWant:
-		nameW = nameWant
-		descW = 0
-	case width-fixedNoDesc >= nameMin:
-		nameW = width - fixedNoDesc
-		descW = 0
-	default:
-		nameW = nameMin
+	descW := width - fixedWithDesc - nameW
+	if descW < descMin {
 		descW = 0
 	}
 
@@ -260,17 +310,24 @@ func MutedText(text string) string {
 }
 
 // HelpOverlayBox builds a centered help block — bordered, body left-aligned.
+// `width` is the outer width (border-inclusive). lipgloss.Style.Width sets
+// padding+content, so we subtract just the border to land on the requested
+// outer width — same convention used by Panel. Otherwise content gets wrapped
+// inside a frame that's actually 4 columns narrower than the caller asked
+// for, which on a 70-col terminal produces ugly mid-word breaks like
+// "bottom of\npanel".
 func HelpOverlayBox(body string, width int) string {
 	style := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(Accent).
 		Padding(1, 2).
 		Foreground(Text)
-	innerWidth := width - style.GetHorizontalFrameSize()
-	if innerWidth < 20 {
-		innerWidth = 20
+	frameW := width - style.GetHorizontalBorderSize()
+	min := style.GetHorizontalPadding() + 20
+	if frameW < min {
+		frameW = min
 	}
-	return style.Width(innerWidth).Render(body)
+	return style.Width(frameW).Render(body)
 }
 
 // ConfirmPrompt is shown inline at the bottom for y/N decisions.
