@@ -2,9 +2,11 @@
 
 [English](README.md)
 
-`skill-toggle` 是一个小型终端 UI，用来在 Codex、Claude 和 agents 风格工具使用的三个本地 skill 根目录之间统一启用、禁用、更新和软连接 skill。
+**三套 skill，一个开关台。**
 
-它会把 `~/.agents/skills`、`~/.claude/skills`、`~/.codex/skills` 聚合到一个视图里。你可以标记多个切换操作后一次应用，也可以把一个真实 skill 目录通过安全的单 skill symlink 暴露到其他 root。
+`skill-toggle` 把 Agents、Claude、Codex 的本地 skills 聚到一个 TUI：开关、更新、搜索、预览、跨 root 软连接，都在同一屏完成。
+
+用 `Space` 标记批量操作，`t` 应用；用 `L` 把一个真实 skill 安全暴露给其他 root，不复制、不误删。
 
 ## 截图
 

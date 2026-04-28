@@ -2,9 +2,11 @@
 
 [中文说明](README.zh-CN.md)
 
-`skill-toggle` is a small terminal UI for enabling, disabling, updating, and linking local agent skills across the three live skill roots used by Codex/Claude/agents-style tooling.
+**One switchboard for Agents, Claude, and Codex skills.**
 
-It aggregates skills from `~/.agents/skills`, `~/.claude/skills`, and `~/.codex/skills` into one view, lets you mark toggles, applies them as folder moves between each source root and a single global off directory, and can expose one real skill folder to sibling roots through safe per-skill symlinks.
+`skill-toggle` brings the three local skill roots into one TUI for toggling, updating, searching, previewing, and safe per-skill symlink linking.
+
+Mark batch changes with `Space`, apply them with `t`, or press `L` to expose one real skill folder to another root without copying or deleting it.
 
 ## Screenshots
 
