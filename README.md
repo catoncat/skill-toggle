@@ -4,11 +4,25 @@
 
 It aggregates skills from `~/.agents/skills`, `~/.claude/skills`, and `~/.codex/skills` into one view, lets you stage toggles, and applies them as folder moves between each source root and a single global off directory.
 
+## Screenshots
+
+### Main TUI
+
+<img src="docs/assets/main.png" alt="skill-toggle main TUI" width="900">
+
+### Filtered skills
+
+<img src="docs/assets/marke_filter.png" alt="skill-toggle filtered skills" width="900">
+
+### Help overlay
+
+<img src="docs/assets/help.png" alt="skill-toggle help overlay" width="900">
+
 ## What It Does
 
 - Aggregates skills across all three live roots — no profile to pick.
 - Lazygit-style TUI: a single skill list on the left filterable by `a` (all) / `e` (enabled) / `d` (disabled), with a SKILL.md preview on the right.
-- Stages toggles with `Space` and applies them in one batch with `A`. Files don't move until you commit.
+- Marks multiple toggles with `Space`, then applies the marked batch with `t`; with no marks, `t` toggles the current row immediately.
 - Searches by name, source, or description.
 - Sorts by name, description size descending, or description size ascending.
 - Runs `npx skills update` for one enabled skill or all global skills.
@@ -46,9 +60,10 @@ a / e / d          filter list (all / enabled-only / disabled-only)
 j/k or ↑/↓         move cursor
 g / G              top / bottom of list
 ctrl+d / ctrl+u    half page down / up
-space              stage / unstage current skill
-A                  apply all staged operations
-C                  clear all staged operations
+space              mark / unmark current skill
+t                  toggle current skill, or apply marked operations
+C                  clear marked operations
+L                  link / unlink current skill to another root
 p / enter / tab    full-screen SKILL.md preview (toggle)
 /                  search (matches name, source, description)
 esc                clear search / dismiss message
@@ -59,7 +74,7 @@ U                  update all global skills (live progress overlay)
 F                  fetch upstream sha for current skill (check, no install)
 r                  rescan filesystem
 ?                  help overlay
-q                  quit (confirms if changes are staged)
+q                  quit (confirms if changes are marked)
 ctrl+c             hard quit
 ```
 

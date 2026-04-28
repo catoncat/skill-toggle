@@ -1,3 +1,7 @@
+# OS
+.DS_Store
+
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -10,11 +14,13 @@ dist/
 
 # Go
 /skill-toggle
+coverage.out
 *.out
 *.test
 
 # Local editor / agent config
 /.claude/
+/.idea/
 /.vscode/
 /.github/copilot-instructions.md
 
