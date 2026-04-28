@@ -3,112 +3,141 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 )
 
-// Color palette — lazygit-inspired: muted greys, a single soft accent for the
-// active panel, semantic green/yellow/red for status & staging signals only.
+// Color palette — uses ANSI palette indices (0-15) instead of hard-coded hex
+// values so the terminal theme (Solarized, Gruvbox, Tokyo Night, …) drives the
+// actual hue. The TUI inherits whatever the user already configured for their
+// shell, which is what lazygit does too. The trade-off is that we can't tune
+// individual shades, but consistency with the user's environment matters more.
+//
+// Indices used:
+//
+//	1  red        2 green        3 yellow       4 blue
+//	5  magenta    6 cyan         7 white        8 bright black (gray)
 var (
-	Text         = lipgloss.AdaptiveColor{Light: "#1F2430", Dark: "#D7DAE0"}
-	Muted        = lipgloss.AdaptiveColor{Light: "#7A8190", Dark: "#7A8190"}
-	Subtle       = lipgloss.AdaptiveColor{Light: "#A0A6B0", Dark: "#5A6068"}
-	Border       = lipgloss.AdaptiveColor{Light: "#C2C7D0", Dark: "#3A3F4A"}
-	BorderActive = lipgloss.AdaptiveColor{Light: "#3D74B0", Dark: "#7AAFE5"}
-	Accent       = lipgloss.AdaptiveColor{Light: "#3D74B0", Dark: "#7AAFE5"}
-	Success      = lipgloss.AdaptiveColor{Light: "#2C8A4E", Dark: "#5FB875"}
-	Warning      = lipgloss.AdaptiveColor{Light: "#A06000", Dark: "#D4A75A"}
-	Danger       = lipgloss.AdaptiveColor{Light: "#B43836", Dark: "#E37A75"}
-	SelectionBg  = lipgloss.AdaptiveColor{Light: "#D8E3F2", Dark: "#2A3340"}
+	// Border line for every panel — quiet gray. Inactive == active by design;
+	// activation is conveyed through the selection cursor + bold title, not
+	// through a high-contrast frame color.
+	Border = lipgloss.Color("8")
+
+	// Title text inside the top border. Active panels render bold + cyan to
+	// pop without drowning the frame; inactive panels drop to Muted.
+	TitleColor = lipgloss.Color("6")
+
+	// Accent — used by key hints, search prompt, markdown headings.
+	Accent = lipgloss.Color("4")
+
+	// Muted secondary text (sources, char counts, hint labels).
+	Muted = lipgloss.Color("8")
+
+	// Subtle — even quieter than Muted (description on disabled rows).
+	Subtle = lipgloss.Color("8")
+
+	// Semantic statuses.
+	Success = lipgloss.Color("2")
+	Warning = lipgloss.Color("3")
+	Danger  = lipgloss.Color("1")
 )
 
-// Panel renders a bordered region. width and height count the OUTER size
-// (border-inclusive). Pass active=true to highlight the border. number is the
-// 1-based panel id rendered as a `[N]` prefix to the title; pass 0 to omit.
-func Panel(number int, title string, body string, width, height int, active bool) string {
-	border := Border
-	if active {
-		border = BorderActive
+// Panel renders a bordered region with the title embedded in the top border
+// (lazygit-style: `╭─ Title ────────╮`). width and height count the OUTER
+// size (border-inclusive). Pass active=true to make the title bold + accent;
+// the border itself stays the same color either way so the user's eye is
+// drawn to row selection rather than the frame.
+func Panel(title string, body string, width, height int, active bool) string {
+	if width < 2 {
+		width = 2
 	}
-	style := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(border).
-		Padding(0, 1)
-
-	// lipgloss style.Width sets padding+content, so we subtract just the
-	// border to land on the requested outer width after rendering.
-	frameW := width - style.GetHorizontalBorderSize()
-	if frameW < 1 {
-		frameW = 1
-	}
-	frameH := height - style.GetVerticalBorderSize()
-	if frameH < 1 {
-		frameH = 1
+	if height < 2 {
+		height = 2
 	}
 
-	contentWidth := frameW - style.GetHorizontalPadding()
+	innerWidth := width - 2
+	if innerWidth < 1 {
+		innerWidth = 1
+	}
+	innerHeight := height - 2
+	if innerHeight < 1 {
+		innerHeight = 1
+	}
+
+	// Account for the 1-cell horizontal padding we apply to body content.
+	contentWidth := innerWidth - 2
 	if contentWidth < 1 {
 		contentWidth = 1
 	}
-	contentHeight := frameH - style.GetVerticalPadding()
-	if contentHeight < 1 {
-		contentHeight = 1
-	}
 
-	titleStyled := PanelTitle(number, title, active, contentWidth)
-	bodyHeight := contentHeight - 1
-	if bodyHeight < 0 {
-		bodyHeight = 0
-	}
+	borderStyle := lipgloss.NewStyle().Foreground(Border)
+	side := borderStyle.Render("│")
+
+	top := renderTopBorder(title, width, active)
+	bottom := borderStyle.Render("╰" + strings.Repeat("─", innerWidth) + "╯")
+
 	bodyLines := strings.Split(body, "\n")
-	if len(bodyLines) > bodyHeight {
-		bodyLines = bodyLines[:bodyHeight]
+	if len(bodyLines) > innerHeight {
+		bodyLines = bodyLines[:innerHeight]
 	}
-	for len(bodyLines) < bodyHeight {
+	for len(bodyLines) < innerHeight {
 		bodyLines = append(bodyLines, "")
 	}
-	for i, line := range bodyLines {
-		bodyLines[i] = PadRight(TrimToWidth(line, contentWidth), contentWidth)
+
+	rows := make([]string, 0, innerHeight+2)
+	rows = append(rows, top)
+	for _, line := range bodyLines {
+		// Pad the body line to the inner content width so the right border
+		// lands at the same column on every row.
+		line = PadRight(TrimToWidth(line, contentWidth), contentWidth)
+		rows = append(rows, side+" "+line+" "+side)
 	}
-	content := titleStyled
-	if len(bodyLines) > 0 {
-		content += "\n" + strings.Join(bodyLines, "\n")
-	}
-	return style.Width(frameW).Height(frameH).Render(content)
+	rows = append(rows, bottom)
+	return strings.Join(rows, "\n")
 }
 
-// PanelTitle renders a panel title line. When number > 0 the title is
-// prefixed with `[N] ` (lazygit-style); the bracketed number is highlighted
-// in Accent on the active panel and Muted on inactive panels so the focused
-// panel is identifiable without reading border colors. The title text itself
-// is bold + Accent on active, default color on inactive.
-func PanelTitle(number int, title string, active bool, width int) string {
-	titleColor := Muted
-	if active {
-		titleColor = Accent
+// renderTopBorder builds the top border line with the title embedded:
+//
+//	╭─ Title ─────────────╮
+//
+// When the title is too long, it is truncated with an ellipsis. When the
+// outer width is too narrow to fit the title at all, we fall back to a plain
+// horizontal line.
+func renderTopBorder(title string, outerWidth int, active bool) string {
+	innerWidth := outerWidth - 2
+	if innerWidth < 1 {
+		innerWidth = 1
 	}
-	titleStyle := lipgloss.NewStyle().Foreground(titleColor).Bold(active)
+	borderStyle := lipgloss.NewStyle().Foreground(Border)
 
-	var rendered string
-	if number > 0 {
-		numColor := Muted
-		if active {
-			numColor = Accent
-		}
-		numStyle := lipgloss.NewStyle().Foreground(numColor).Bold(true)
-		rendered = numStyle.Render(fmt.Sprintf("[%d] ", number)) + titleStyle.Render(title)
-	} else {
-		rendered = titleStyle.Render("  " + title)
+	titleStyle := lipgloss.NewStyle().Foreground(TitleColor).Bold(true)
+	if !active {
+		titleStyle = lipgloss.NewStyle().Foreground(Muted)
 	}
 
-	pad := width - lipgloss.Width(rendered)
-	if pad > 0 {
-		rendered += strings.Repeat(" ", pad)
-	} else if pad < 0 {
-		rendered = TrimToWidth(rendered, width)
+	// Layout: ╭─ SP <title> SP ─{n}─ ╮
+	// Reserved cells inside innerWidth: 1 (─) + 1 (SP) + 1 (SP) + 1 (─ minimum on right)
+	const reserved = 4
+	titleBudget := innerWidth - reserved
+	if titleBudget < 1 || title == "" {
+		// No room for an embedded title — fall back to a plain top line.
+		return borderStyle.Render("╭" + strings.Repeat("─", innerWidth) + "╮")
 	}
-	return rendered
+	t := TrimToWidth(title, titleBudget)
+	tw := lipgloss.Width(t)
+
+	// Right-side dash fill = innerWidth - 1 (left dash) - 2 (spaces) - tw
+	rightDashes := innerWidth - 3 - tw
+	if rightDashes < 1 {
+		rightDashes = 1
+	}
+
+	leftSeg := borderStyle.Render("╭─ ")
+	titleSeg := titleStyle.Render(t)
+	rightSeg := borderStyle.Render(" " + strings.Repeat("─", rightDashes) + "╮")
+	return leftSeg + titleSeg + rightSeg
 }
 
 // NameColumnWidth picks a panel-wide name column width using the standard
@@ -116,11 +145,12 @@ func PanelTitle(number int, title string, active bool, width int) string {
 // [nameMin, cap]. The cap is min(28, half the budget left after the
 // fixed columns) so a runaway long skill name can't starve description.
 //
-// Pass the result to every SkillRow rendered for that panel so source /
+// Pass the result to every SkillRow rendered for that panel so presence /
 // chars / description columns line up across rows.
 func NameColumnWidth(names []string, width int) int {
 	const (
-		fixedWithDesc = 18
+		// Mirror SkillRow's fixedWithDesc — see the constant block there.
+		fixedWithDesc = 14
 		nameMin       = 12
 		nameMaxAbs    = 28
 	)
@@ -151,29 +181,108 @@ func NameColumnWidth(names []string, width int) int {
 	return maxName
 }
 
-// SkillRow formats a single row in the Enabled/Disabled list.
+// presenceLetters maps the built-in source names to their bitmap letters.
+// agents/claude/codex are the only sources skill-toggle ships with; if a
+// caller passes an unknown name we fall back to its first letter (lower
+// case → masquerades as a link, never as real). The map is ASCII-only so
+// the column renders identically across terminals and themes.
+//
+// codex starts with 'c' just like claude, so it gets 'x' to keep the
+// bitmap unambiguous. The same letters double as semantic shortcut keys
+// in the L (link) confirm menu, so any change here propagates there.
+var presenceLetters = map[string]rune{
+	"agents": 'a',
+	"claude": 'c',
+	"codex":  'x',
+}
+
+// LetterForSource returns the lowercase glyph used to represent the given
+// source — both in the presence bitmap (where uppercase = real and
+// lowercase = link) and as the semantic shortcut key in the L confirm
+// menu. Unknown sources fall back to their first lowercase letter, or
+// '?' for an empty string.
+func LetterForSource(source string) rune {
+	if r, ok := presenceLetters[source]; ok {
+		return r
+	}
+	runes := []rune(source)
+	if len(runes) == 0 {
+		return '?'
+	}
+	return unicode.ToLower(runes[0])
+}
+
+// FormatPresence renders the 3-character a/c/x bitmap for a skill's
+// per-source visibility. The order matches sources; each glyph is the
+// uppercase letter for "real", lowercase for "link", or '·' for missing.
+// Unknown sources fall back to the first letter of the source name.
+//
+// Width is exactly len(sources) ASCII columns so callers can budget
+// against it just like a fixed-width source string.
+func FormatPresence(presence map[string]string, sources []string) string {
+	if len(sources) == 0 {
+		return ""
+	}
+	out := make([]rune, 0, len(sources))
+	for _, src := range sources {
+		letter, ok := presenceLetters[src]
+		if !ok {
+			r := []rune(src)
+			if len(r) == 0 {
+				letter = '?'
+			} else {
+				letter = r[0]
+				if letter >= 'A' && letter <= 'Z' {
+					letter = letter + ('a' - 'A')
+				}
+			}
+		}
+		switch presence[src] {
+		case "real":
+			out = append(out, unicode.ToUpper(letter))
+		case "link":
+			out = append(out, unicode.ToLower(letter))
+		default:
+			out = append(out, '·')
+		}
+	}
+	return string(out)
+}
+
+// SkillRow formats a single row in the skill list.
 //
 // width       = total cell width
+// presence    = per-source visibility map (key: source name, value: "real"
+//
+//	/ "link" / "missing"); rendered into a fixed-width
+//	a/c/x bitmap via FormatPresence
+//
+// sources     = source name order matching the bitmap columns (e.g.
+//
+//	["agents", "claude", "codex"])
+//
 // nameColW    = pre-computed column width for the name field (caller is
-//               expected to compute this once per render with the panel's
-//               max name width — see NameColumnWidth — so all rows in the
-//               panel share the same source/chars/desc column starts)
+//
+//	expected to compute this once per render with the panel's
+//	max name width — see NameColumnWidth — so all rows in the
+//	panel share the same presence/chars/desc column starts)
+//
 // selected    = cursor sits on this row in the panel
 // activePanel = whether the panel containing this row currently has focus
 // staged      = the row is staged for toggling
 //
 // Layout (visible columns):
 //
-//	<staged><cursor><name>SP<source>SP<chars>[SP<description>]
-//	  1       2     nameColW 1   7     1   5     1   M
+//	<staged><cursor><name>SP<presence>SP<chars>[SP<description>]
+//	  1       2     nameColW 1   N     1   5     1   M
+//
+// Presence column width equals len(sources) (3 for the built-in trio).
 //
 // Status (ON/OFF) is conveyed by panel placement plus name color: enabled
 // rows leave the foreground unset (terminal default — adapts to dark/light
 // themes without relying on Lip Gloss adaptive color), disabled rows use
-// Muted. Total visible width is held to exactly `width` so the outer
-// Panel never has to re-trim a styled string (which would risk cutting an
-// ANSI escape sequence in half and producing replacement glyphs like `◇`).
-func SkillRow(name, source, description string, descChars int, status string, selected, activePanel, staged bool, nameColW, width int) string {
+// Muted. Selection uses Reverse so any terminal theme stays legible.
+func SkillRow(name string, presence map[string]string, sources []string, description string, descChars int, status string, selected, activePanel, staged bool, nameColW, width int) string {
 	if width < 10 {
 		return TrimToWidth(name, width)
 	}
@@ -190,16 +299,19 @@ func SkillRow(name, source, description string, descChars int, status string, se
 		stagedMarker = lipgloss.NewStyle().Foreground(Warning).Bold(true).Render("~")
 	}
 
+	presenceW := len(sources)
+	if presenceW < 1 {
+		presenceW = 1
+	}
 	const (
-		stagedW       = 1
-		cursorW       = 2
-		sourceW       = 7
-		charsW        = 5
-		nameFloor     = 4
-		descMin       = 6
-		fixedNoDesc   = stagedW + cursorW + 1 + sourceW + 1 + charsW // 17
-		fixedWithDesc = fixedNoDesc + 1                              // 18 (desc spacer)
+		stagedW   = 1
+		cursorW   = 2
+		charsW    = 5
+		nameFloor = 4
+		descMin   = 6
 	)
+	fixedNoDesc := stagedW + cursorW + 1 + presenceW + 1 + charsW
+	fixedWithDesc := fixedNoDesc + 1
 
 	// Cap nameColW so the row can never exceed the cell width: nameW must
 	// fit within (width - fixedNoDesc) at minimum.
@@ -222,15 +334,17 @@ func SkillRow(name, source, description string, descChars int, status string, se
 		nameStyle = lipgloss.NewStyle().Foreground(Muted)
 		descStyle = lipgloss.NewStyle().Foreground(Subtle)
 	}
-	sourceStyle := lipgloss.NewStyle().Foreground(Muted)
+	presenceStyle := lipgloss.NewStyle().Foreground(Muted)
 	charsStyle := lipgloss.NewStyle().Foreground(Subtle)
+
+	presenceText := FormatPresence(presence, sources)
 
 	parts := []string{
 		stagedMarker,
 		cursor,
 		PadRight(nameStyle.Render(TrimToWidth(name, nameW)), nameW),
 		" ",
-		PadRight(sourceStyle.Render(TrimToWidth(source, sourceW)), sourceW),
+		PadRight(presenceStyle.Render(TrimToWidth(presenceText, presenceW)), presenceW),
 		" ",
 		PadRight(charsStyle.Render(FormatDescChars(descChars)), charsW),
 	}
@@ -244,7 +358,10 @@ func SkillRow(name, source, description string, descChars int, status string, se
 	}
 
 	if selected && activePanel {
-		row = lipgloss.NewStyle().Background(SelectionBg).Render(row)
+		// Reverse video flips fg/bg using whatever colors the terminal theme
+		// has set, so selection stays legible on light, dark, and high-
+		// contrast schemes without us picking a specific tint.
+		row = lipgloss.NewStyle().Reverse(true).Render(row)
 	}
 	return row
 }
@@ -288,7 +405,7 @@ func SearchPrompt(query string, width int) string {
 	prefix := lipgloss.NewStyle().Foreground(Accent).Bold(true).Render("/ ")
 	cursor := lipgloss.NewStyle().Foreground(Accent).Render("▍")
 	hint := lipgloss.NewStyle().Foreground(Subtle).Italic(true).Render(" matches name · source · description")
-	rendered := prefix + lipgloss.NewStyle().Foreground(Text).Render(query) + cursor
+	rendered := prefix + query + cursor
 	used := lipgloss.Width(rendered) + lipgloss.Width(hint)
 	if used <= width {
 		return rendered + strings.Repeat(" ", width-used) + hint
@@ -312,16 +429,14 @@ func MutedText(text string) string {
 // HelpOverlayBox builds a centered help block — bordered, body left-aligned.
 // `width` is the outer width (border-inclusive). lipgloss.Style.Width sets
 // padding+content, so we subtract just the border to land on the requested
-// outer width — same convention used by Panel. Otherwise content gets wrapped
-// inside a frame that's actually 4 columns narrower than the caller asked
-// for, which on a 70-col terminal produces ugly mid-word breaks like
-// "bottom of\npanel".
+// outer width. Subtracting the full frame leaves the box 4 columns short of
+// what callers asked for, which on narrow terminals triggers ugly mid-word
+// wrap inside the help box ("bottom of\npanel").
 func HelpOverlayBox(body string, width int) string {
 	style := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(Accent).
-		Padding(1, 2).
-		Foreground(Text)
+		BorderForeground(Border).
+		Padding(1, 2)
 	frameW := width - style.GetHorizontalBorderSize()
 	min := style.GetHorizontalPadding() + 20
 	if frameW < min {

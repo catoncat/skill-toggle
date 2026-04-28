@@ -486,3 +486,228 @@ func TestScanRootSkipsDotFiles(t *testing.T) {
 		t.Errorf("expected visible/agents, got %s/%s", scanned[0].Name, scanned[0].Source)
 	}
 }
+
+// linkSibling drops a per-skill symlink at <linkRoot>/<name> pointing at the
+// real skill under realRoot, so tests can model the ~/.claude/skills/foo ->
+// ~/.agents/skills/foo pattern that npx skills emits.
+func linkSibling(t *testing.T, realRoot, linkRoot, name string) {
+	t.Helper()
+	if err := os.MkdirAll(linkRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(realRoot, name), filepath.Join(linkRoot, name)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMarkPresenceAcrossThreeRoots(t *testing.T) {
+	dir := t.TempDir()
+	agentsRoot := filepath.Join(dir, "agents-skills")
+	claudeRoot := filepath.Join(dir, "claude-skills")
+	codexRoot := filepath.Join(dir, "codex-skills")
+	off := filepath.Join(dir, "off")
+
+	// agents-only skill.
+	writeSkill(t, agentsRoot, "solo", "agents-only")
+	// agents real + claude symlink (npx skills add pattern).
+	writeSkill(t, agentsRoot, "linked", "agents real")
+	linkSibling(t, agentsRoot, claudeRoot, "linked")
+	// claude-only manual skill.
+	writeSkill(t, claudeRoot, "claude-only", "manual claude")
+	// codex disabled (lives only in off pool).
+	writeSkill(t, filepath.Join(off, "codex"), "off-only", "disabled")
+
+	sources := []Source{
+		{Name: "agents", Root: agentsRoot},
+		{Name: "claude", Root: claudeRoot},
+		{Name: "codex", Root: codexRoot},
+	}
+	all, err := Scan(sources, off)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Find the canonical (non-duplicate) row for each name. Symlinked
+	// duplicates may also be present but share the same Presence map.
+	byName := map[string]Skill{}
+	for _, s := range all {
+		if s.IsDuplicate {
+			continue
+		}
+		byName[s.Name] = s
+	}
+
+	cases := []struct {
+		name string
+		want map[string]string
+	}{
+		{"solo", map[string]string{"agents": PresenceReal, "claude": PresenceMissing, "codex": PresenceMissing}},
+		{"linked", map[string]string{"agents": PresenceReal, "claude": PresenceLink, "codex": PresenceMissing}},
+		{"claude-only", map[string]string{"agents": PresenceMissing, "claude": PresenceReal, "codex": PresenceMissing}},
+		{"off-only", map[string]string{"agents": PresenceMissing, "claude": PresenceMissing, "codex": PresenceMissing}},
+	}
+	for _, c := range cases {
+		got := byName[c.name].Presence
+		if got == nil {
+			t.Errorf("%s: missing Presence map", c.name)
+			continue
+		}
+		for src, want := range c.want {
+			if got[src] != want {
+				t.Errorf("%s.Presence[%s] = %q, want %q", c.name, src, got[src], want)
+			}
+		}
+	}
+}
+
+func TestMarkPresenceMultiRealIndependent(t *testing.T) {
+	dir := t.TempDir()
+	agentsRoot := filepath.Join(dir, "agents-skills")
+	claudeRoot := filepath.Join(dir, "claude-skills")
+	off := filepath.Join(dir, "off")
+
+	// Two independent real copies of the same name (different SKILL.md).
+	writeSkill(t, agentsRoot, "shared", "from agents")
+	writeSkill(t, claudeRoot, "shared", "from claude")
+
+	all, err := Scan([]Source{
+		{Name: "agents", Root: agentsRoot},
+		{Name: "claude", Root: claudeRoot},
+	}, off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("expected 2 distinct rows, got %d", len(all))
+	}
+	for _, s := range all {
+		if s.Presence["agents"] != PresenceReal {
+			t.Errorf("%s/%s.Presence[agents] = %q, want real", s.Source, s.Name, s.Presence["agents"])
+		}
+		if s.Presence["claude"] != PresenceReal {
+			t.Errorf("%s/%s.Presence[claude] = %q, want real", s.Source, s.Name, s.Presence["claude"])
+		}
+	}
+}
+
+func TestApplyLinkOpCreates(t *testing.T) {
+	dir := t.TempDir()
+	agentsRoot := filepath.Join(dir, "agents-skills")
+	claudeRoot := filepath.Join(dir, "claude-skills")
+
+	writeSkill(t, agentsRoot, "foo", "real")
+
+	op := PlanLink(Skill{Name: "foo", Path: filepath.Join(agentsRoot, "foo")}, "claude", claudeRoot)
+	if err := ApplyLinkOp(op); err != nil {
+		t.Fatalf("apply link: %v", err)
+	}
+
+	target := filepath.Join(claudeRoot, "foo")
+	fi, err := os.Lstat(target)
+	if err != nil {
+		t.Fatalf("expected symlink at %s: %v", target, err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%s is not a symlink", target)
+	}
+	resolved, err := os.Readlink(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != filepath.Join(agentsRoot, "foo") {
+		t.Errorf("symlink points at %q, want %q", resolved, filepath.Join(agentsRoot, "foo"))
+	}
+	// Source must still exist with SKILL.md intact.
+	if _, err := os.Stat(filepath.Join(agentsRoot, "foo", "SKILL.md")); err != nil {
+		t.Errorf("source SKILL.md should remain readable: %v", err)
+	}
+}
+
+func TestApplyLinkOpUnlinksSymlinkOnly(t *testing.T) {
+	dir := t.TempDir()
+	agentsRoot := filepath.Join(dir, "agents-skills")
+	claudeRoot := filepath.Join(dir, "claude-skills")
+
+	writeSkill(t, agentsRoot, "foo", "real")
+	linkSibling(t, agentsRoot, claudeRoot, "foo")
+
+	op := PlanUnlink(Skill{Name: "foo"}, "claude", claudeRoot)
+	if err := ApplyLinkOp(op); err != nil {
+		t.Fatalf("apply unlink: %v", err)
+	}
+
+	if _, err := os.Lstat(filepath.Join(claudeRoot, "foo")); !os.IsNotExist(err) {
+		t.Errorf("expected claude/foo symlink to be removed, lstat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(agentsRoot, "foo", "SKILL.md")); err != nil {
+		t.Errorf("real source must survive unlink: %v", err)
+	}
+}
+
+func TestApplyLinkOpRefusesUnlinkOfRealDir(t *testing.T) {
+	dir := t.TempDir()
+	claudeRoot := filepath.Join(dir, "claude-skills")
+	writeSkill(t, claudeRoot, "manual", "real claude entry")
+
+	op := PlanUnlink(Skill{Name: "manual"}, "claude", claudeRoot)
+	err := ApplyLinkOp(op)
+	if err == nil {
+		t.Fatal("expected refusal for unlinking a real directory")
+	}
+	if !strings.Contains(err.Error(), "not a symlink") {
+		t.Fatalf("expected 'not a symlink' error, got: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(claudeRoot, "manual", "SKILL.md")); err != nil {
+		t.Errorf("real dir must remain after refused unlink: %v", err)
+	}
+}
+
+func TestApplyLinkOpRefusesExistingTarget(t *testing.T) {
+	dir := t.TempDir()
+	agentsRoot := filepath.Join(dir, "agents-skills")
+	claudeRoot := filepath.Join(dir, "claude-skills")
+
+	writeSkill(t, agentsRoot, "foo", "real")
+	writeSkill(t, claudeRoot, "foo", "preexisting claude") // collision
+
+	op := PlanLink(Skill{Name: "foo", Path: filepath.Join(agentsRoot, "foo")}, "claude", claudeRoot)
+	err := ApplyLinkOp(op)
+	if err == nil {
+		t.Fatal("expected refusal when target already exists")
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("expected 'already exists', got: %v", err)
+	}
+}
+
+func TestApplyLinkOpRefusesProtected(t *testing.T) {
+	dir := t.TempDir()
+	agentsRoot := filepath.Join(dir, "agents-skills")
+	claudeRoot := filepath.Join(dir, "claude-skills")
+
+	os.MkdirAll(filepath.Join(agentsRoot, ".system"), 0755)
+	os.WriteFile(filepath.Join(agentsRoot, ".system", "SKILL.md"), []byte("---\n---\n"), 0644)
+
+	op := PlanLink(Skill{Name: ".system", Path: filepath.Join(agentsRoot, ".system")}, "claude", claudeRoot)
+	if err := ApplyLinkOp(op); err == nil {
+		t.Fatal("expected protected refusal")
+	}
+}
+
+func TestApplyLinkOpRefusesMissingSKILLMD(t *testing.T) {
+	dir := t.TempDir()
+	agentsRoot := filepath.Join(dir, "agents-skills")
+	claudeRoot := filepath.Join(dir, "claude-skills")
+
+	if err := os.MkdirAll(filepath.Join(agentsRoot, "bogus"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	op := PlanLink(Skill{Name: "bogus", Path: filepath.Join(agentsRoot, "bogus")}, "claude", claudeRoot)
+	err := ApplyLinkOp(op)
+	if err == nil {
+		t.Fatal("expected error for source without SKILL.md")
+	}
+	if !strings.Contains(err.Error(), "SKILL.md") {
+		t.Fatalf("expected SKILL.md error, got: %v", err)
+	}
+}

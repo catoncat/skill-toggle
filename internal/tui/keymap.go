@@ -24,12 +24,14 @@ func helpEntries() []helpEntry {
 		{"Filter", ".", "toggle symlinks"},
 		{"Filter", "s", "cycle sort"},
 
-		{"Skill", "space", "stage / unstage"},
-		{"Skill", "A", "apply staged ops"},
-		{"Skill", "C", "clear staged"},
+		{"Skill", "space", "mark / unmark"},
+		{"Skill", "t", "toggle (cursor or marked)"},
+		{"Skill", "C", "clear marks"},
+		{"Skill", "L", "link / unlink to other root"},
 		{"Skill", "p / enter / tab", "open preview"},
 		{"Skill", "u", "update skill"},
 		{"Skill", "U", "update all"},
+		{"Skill", "F", "fetch upstream sha (check)"},
 		{"Skill", "r", "rescan disk"},
 
 		{"View", "?", "toggle help"},
@@ -63,8 +65,8 @@ func keyStripHints(m Model) []hintPair {
 		return []hintPair{
 			{"a/e/d", "filter"},
 			{"j/k", "move"},
-			{"space", "stage"},
-			{"A", "apply"},
+			{"space", "mark"},
+			{"t", "toggle"},
 			{"p", "preview"},
 			{"/", "search"},
 			{"u/U", "update"},

@@ -56,6 +56,7 @@ esc                clear search / dismiss message
 s                  cycle sort (name → size↓ → size↑)
 u                  update current enabled skill (live progress overlay)
 U                  update all global skills (live progress overlay)
+F                  fetch upstream sha for current skill (check, no install)
 r                  rescan filesystem
 ?                  help overlay
 q                  quit (confirms if changes are staged)

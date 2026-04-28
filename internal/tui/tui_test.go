@@ -1,11 +1,17 @@
 package tui
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/catoncat/skill-toggle/internal/freshness"
+	"github.com/catoncat/skill-toggle/internal/lockfile"
 	"github.com/catoncat/skill-toggle/internal/skills"
+	"github.com/catoncat/skill-toggle/internal/update"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -452,7 +458,7 @@ func TestLinkedDuplicatesShownAfterDot(t *testing.T) {
 		{
 			Name: "shared", Source: "agents", DisplayName: "shared",
 			Description: "primary", DescriptionChars: 7, Status: "enabled",
-			Path:        "/tmp/agents/skills/shared",
+			Path: "/tmp/agents/skills/shared",
 		},
 		{
 			Name: "shared", Source: "claude", DisplayName: "shared",
@@ -468,5 +474,704 @@ func TestLinkedDuplicatesShownAfterDot(t *testing.T) {
 	}
 	if len(nm.visibleList) != 2 {
 		t.Fatalf("expected both rows after toggle, got %d", len(nm.visibleList))
+	}
+}
+
+// --- update overlay scroll regression tests ---
+
+func updateTestModel(height, lineCount int) Model {
+	m := newTestModel(120, height, nil)
+	m.mode = modeUpdate
+	for i := 0; i < lineCount; i++ {
+		m.appendUpdateLine(update.Line{Text: fmt.Sprintf("line-%d", i)})
+	}
+	return m
+}
+
+func TestUpdateScrollGGoesToTopNotPastIt(t *testing.T) {
+	// 200 lines in a window where inner = h - 4 = 28.
+	m := updateTestModel(32, 200)
+	next, _ := m.handleUpdateKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	nm := next.(Model)
+	expected := nm.maxUpdateScroll()
+	if nm.updateScrollOffset != expected {
+		t.Fatalf("g should land on maxUpdateScroll=%d, got %d", expected, nm.updateScrollOffset)
+	}
+	// View should still produce non-empty content (was empty in the bug).
+	visible := nm.updateVisibleLines(nm.updateInnerHeight(), 80)
+	if !strings.Contains(strings.Join(visible, "\n"), "line-0") {
+		t.Fatalf("g should reveal the oldest line, got: %q", visible)
+	}
+}
+
+func TestUpdateScrollKDoesNotEscapePastTop(t *testing.T) {
+	m := updateTestModel(32, 50)
+	max := m.maxUpdateScroll()
+	// Press k 1000 times; offset must clamp to maxUpdateScroll.
+	for i := 0; i < 1000; i++ {
+		next, _ := m.handleUpdateKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+		m = next.(Model)
+	}
+	if m.updateScrollOffset != max {
+		t.Fatalf("k spam should clamp at %d, got %d", max, m.updateScrollOffset)
+	}
+}
+
+func TestUpdateScrollFollowsBottomByDefault(t *testing.T) {
+	m := updateTestModel(32, 5)
+	if m.updateScrollOffset != 0 {
+		t.Fatalf("expected offset=0 by default, got %d", m.updateScrollOffset)
+	}
+	// Append more — still following bottom.
+	m.appendUpdateLine(update.Line{Text: "fresh"})
+	if m.updateScrollOffset != 0 {
+		t.Fatalf("offset must stay 0 while following, got %d", m.updateScrollOffset)
+	}
+}
+
+func TestUpdateScrollAnchorsOnAppend(t *testing.T) {
+	m := updateTestModel(32, 100)
+	// Scroll up 5 lines.
+	for i := 0; i < 5; i++ {
+		next, _ := m.handleUpdateKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+		m = next.(Model)
+	}
+	if m.updateScrollOffset != 5 {
+		t.Fatalf("setup expected offset=5, got %d", m.updateScrollOffset)
+	}
+	// What line is at the top of the visible window?
+	inner := m.updateInnerHeight()
+	end := len(m.updateLines) - m.updateScrollOffset
+	topLine := m.updateLines[end-inner]
+
+	// Append 3 lines — view should remain anchored on the same absolute line.
+	for i := 0; i < 3; i++ {
+		m.appendUpdateLine(update.Line{Text: fmt.Sprintf("new-%d", i)})
+	}
+	if m.updateScrollOffset != 8 {
+		t.Fatalf("offset should track new lines while scrolled, got %d", m.updateScrollOffset)
+	}
+	end = len(m.updateLines) - m.updateScrollOffset
+	if got := m.updateLines[end-inner]; got != topLine {
+		t.Fatalf("top of window drifted: was %q, now %q", topLine, got)
+	}
+}
+
+func TestUpdateScrollGCapitalSnapsToBottom(t *testing.T) {
+	m := updateTestModel(32, 200)
+	m.updateScrollOffset = 50
+	next, _ := m.handleUpdateKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")})
+	if next.(Model).updateScrollOffset != 0 {
+		t.Fatalf("G should snap to 0, got %d", next.(Model).updateScrollOffset)
+	}
+}
+
+func TestFreshnessKeyRefusesUnmanaged(t *testing.T) {
+	m := newTestModel(140, 32, []skills.Skill{
+		{
+			Name: "handcrafted", Source: "agents", DisplayName: "handcrafted",
+			Description: "no lock entry", DescriptionChars: 14, Status: "enabled",
+			Path:    "/tmp/agents/skills/handcrafted",
+			Managed: false,
+		},
+	})
+	m.freshnessChecker = freshness.NewChecker()
+	m.freshnessCache = map[string]freshness.Result{}
+	m.freshnessInflight = map[string]bool{}
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("F")})
+	nm := next.(Model)
+	if !strings.Contains(nm.message, "not managed") {
+		t.Fatalf("expected unmanaged message, got %q", nm.message)
+	}
+}
+
+func TestFreshnessKeyHitsCacheBeforeNetwork(t *testing.T) {
+	m := newTestModel(140, 32, []skills.Skill{
+		{
+			Name: "managed", Source: "agents", DisplayName: "managed",
+			Description: "via skills add", DescriptionChars: 14, Status: "enabled",
+			Path:       "/tmp/agents/skills/managed",
+			Managed:    true,
+			LockSource: "vercel-labs/agent-skills",
+			LockEntry: &lockfile.Entry{
+				SourceURL:       "https://github.com/vercel-labs/agent-skills.git",
+				SkillPath:       "skills/managed/SKILL.md",
+				SkillFolderHash: "abc12345",
+			},
+		},
+	})
+	m.freshnessChecker = freshness.NewChecker()
+	m.freshnessCache = map[string]freshness.Result{
+		"agents/managed": {
+			LocalSHA:  "abc12345",
+			RemoteSHA: "abc12345",
+			UpToDate:  true,
+			CheckedAt: time.Now(),
+		},
+	}
+	m.freshnessInflight = map[string]bool{}
+	next, cmd := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("F")})
+	nm := next.(Model)
+	if cmd != nil {
+		t.Fatal("cache hit should not issue a tea.Cmd (no network call)")
+	}
+	if !strings.Contains(nm.message, "up to date") {
+		t.Fatalf("expected cached up-to-date message, got %q", nm.message)
+	}
+}
+
+func TestFormatFreshnessStatus(t *testing.T) {
+	cases := []struct {
+		name        string
+		result      freshness.Result
+		err         error
+		wantSubstr  string
+		wantMsgKind string
+	}{
+		{
+			name:        "up-to-date",
+			result:      freshness.Result{LocalSHA: "abc12345", RemoteSHA: "abc12345", UpToDate: true},
+			wantSubstr:  "up to date",
+			wantMsgKind: "info",
+		},
+		{
+			name:        "out-of-date",
+			result:      freshness.Result{LocalSHA: "abc12345", RemoteSHA: "def67890", UpToDate: false},
+			wantSubstr:  "new version available",
+			wantMsgKind: "info",
+		},
+		{
+			name:        "rate-limited",
+			err:         freshness.ErrRateLimited,
+			wantSubstr:  "rate limited",
+			wantMsgKind: "error",
+		},
+		{
+			name:        "unsupported-source",
+			err:         freshness.ErrUnsupported,
+			wantSubstr:  "only github.com",
+			wantMsgKind: "error",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msg, kind := formatFreshnessStatus("agents/foo", tc.result, tc.err)
+			if !strings.Contains(msg, tc.wantSubstr) {
+				t.Errorf("expected %q in message, got %q", tc.wantSubstr, msg)
+			}
+			if kind != tc.wantMsgKind {
+				t.Errorf("expected kind %s, got %s", tc.wantMsgKind, kind)
+			}
+		})
+	}
+}
+
+// --- L key: per-skill link / unlink ---
+
+// withPresence is a tiny helper for L-key tests: build a Skill row with
+// the given Presence map without re-typing all the Skill fields.
+func withPresence(source, name, status string, presence map[string]string) skills.Skill {
+	s := makeSkill(source, name, status, "desc")
+	s.Presence = presence
+	return s
+}
+
+func TestLinkKeyNoCandidatesShowsMessage(t *testing.T) {
+	m := newTestModel(140, 32, []skills.Skill{
+		withPresence("agents", "all-real", "enabled", map[string]string{
+			"agents": skills.PresenceReal,
+			"claude": skills.PresenceReal,
+			"codex":  skills.PresenceReal,
+		}),
+	})
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("L")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmNone {
+		t.Fatalf("expected no confirm when 0 candidates, got %v", nm.pendingConfirm)
+	}
+	if !strings.Contains(nm.message, "no link target") {
+		t.Fatalf("expected no-link-target message, got %q", nm.message)
+	}
+}
+
+func TestLinkKeyOneCandidateEntersSingleConfirm(t *testing.T) {
+	m := newTestModel(140, 32, []skills.Skill{
+		withPresence("agents", "single", "enabled", map[string]string{
+			"agents": skills.PresenceReal,
+			"claude": skills.PresenceMissing,
+			"codex":  skills.PresenceReal,
+		}),
+	})
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("L")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmLinkSingle {
+		t.Fatalf("expected confirmLinkSingle, got %v", nm.pendingConfirm)
+	}
+	if len(nm.pendingLinkOps) != 1 {
+		t.Fatalf("expected 1 pending op, got %d", len(nm.pendingLinkOps))
+	}
+	op := nm.pendingLinkOps[0]
+	if op.TargetSource != "claude" {
+		t.Errorf("expected target=claude, got %s", op.TargetSource)
+	}
+	if op.Action != "link" {
+		t.Errorf("expected action=link, got %s", op.Action)
+	}
+}
+
+func TestLinkKeyTwoCandidatesEntersChoiceConfirm(t *testing.T) {
+	m := newTestModel(140, 32, []skills.Skill{
+		withPresence("agents", "two", "enabled", map[string]string{
+			"agents": skills.PresenceReal,
+			"claude": skills.PresenceMissing,
+			"codex":  skills.PresenceMissing,
+		}),
+	})
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("L")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmLinkChoice {
+		t.Fatalf("expected confirmLinkChoice, got %v", nm.pendingConfirm)
+	}
+	if len(nm.pendingLinkOps) != 2 {
+		t.Fatalf("expected 2 pending ops, got %d", len(nm.pendingLinkOps))
+	}
+}
+
+func TestLinkKeyMixesLinkAndUnlinkCandidates(t *testing.T) {
+	m := newTestModel(140, 32, []skills.Skill{
+		withPresence("agents", "mixed", "enabled", map[string]string{
+			"agents": skills.PresenceReal,
+			"claude": skills.PresenceLink,
+			"codex":  skills.PresenceMissing,
+		}),
+	})
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("L")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmLinkChoice {
+		t.Fatalf("expected confirmLinkChoice, got %v", nm.pendingConfirm)
+	}
+	haveLink, haveUnlink := false, false
+	for _, op := range nm.pendingLinkOps {
+		if op.Action == "link" {
+			haveLink = true
+		}
+		if op.Action == "unlink" {
+			haveUnlink = true
+		}
+	}
+	if !haveLink || !haveUnlink {
+		t.Errorf("expected both link & unlink actions, got %#v", nm.pendingLinkOps)
+	}
+}
+
+func TestLinkKeyRefusesProtected(t *testing.T) {
+	s := withPresence("agents", ".system", "enabled", map[string]string{
+		"agents": skills.PresenceReal,
+		"claude": skills.PresenceMissing,
+		"codex":  skills.PresenceMissing,
+	})
+	s.Protected = true
+	m := newTestModel(140, 32, []skills.Skill{s})
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("L")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmNone {
+		t.Fatalf("expected no confirm for protected, got %v", nm.pendingConfirm)
+	}
+	if !strings.Contains(nm.message, "protected") {
+		t.Fatalf("expected protected message, got %q", nm.message)
+	}
+}
+
+func TestLinkKeyRefusesDisabledRow(t *testing.T) {
+	m := newTestModel(140, 32, []skills.Skill{
+		withPresence("agents", "off-skill", "disabled", map[string]string{
+			"agents": skills.PresenceMissing,
+			"claude": skills.PresenceMissing,
+			"codex":  skills.PresenceMissing,
+		}),
+	})
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("L")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmNone {
+		t.Fatalf("expected no confirm for disabled row, got %v", nm.pendingConfirm)
+	}
+	if !strings.Contains(nm.message, "enabled") {
+		t.Fatalf("expected disabled-row message, got %q", nm.message)
+	}
+}
+
+func TestLinkChoiceEscClears(t *testing.T) {
+	m := newTestModel(140, 32, []skills.Skill{
+		withPresence("agents", "two", "enabled", map[string]string{
+			"agents": skills.PresenceReal,
+			"claude": skills.PresenceMissing,
+			"codex":  skills.PresenceMissing,
+		}),
+	})
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("L")})
+	nm := next.(Model)
+	next2, _ := nm.handleConfirmKey(tea.KeyMsg{Type: tea.KeyEsc})
+	nm2 := next2.(Model)
+	if nm2.pendingConfirm != confirmNone {
+		t.Errorf("esc should clear confirm, got %v", nm2.pendingConfirm)
+	}
+	if len(nm2.pendingLinkOps) != 0 {
+		t.Errorf("esc should clear pendingLinkOps, got %d", len(nm2.pendingLinkOps))
+	}
+}
+
+func TestLinkChoiceNonDigitClears(t *testing.T) {
+	m := newTestModel(140, 32, []skills.Skill{
+		withPresence("agents", "two", "enabled", map[string]string{
+			"agents": skills.PresenceReal,
+			"claude": skills.PresenceMissing,
+			"codex":  skills.PresenceMissing,
+		}),
+	})
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("L")})
+	nm := next.(Model)
+	next2, _ := nm.handleConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	nm2 := next2.(Model)
+	if nm2.pendingConfirm != confirmNone {
+		t.Errorf("non-digit should cancel choice, got %v", nm2.pendingConfirm)
+	}
+	if len(nm2.pendingLinkOps) != 0 {
+		t.Errorf("non-digit should clear pendingLinkOps, got %d", len(nm2.pendingLinkOps))
+	}
+}
+
+func TestLinkSingleConfirmAppliesToFilesystem(t *testing.T) {
+	dir := t.TempDir()
+	agentsRoot := filepath.Join(dir, "agents", "skills")
+	claudeRoot := filepath.Join(dir, "claude", "skills")
+	if err := os.MkdirAll(filepath.Join(agentsRoot, "foo"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentsRoot, "foo", "SKILL.md"),
+		[]byte("---\nname: foo\ndescription: test\n---\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newTestModel(140, 32, nil)
+	m.sources = []skills.Source{
+		{Name: "agents", Root: agentsRoot},
+		{Name: "claude", Root: claudeRoot},
+	}
+	m.allSkills = []skills.Skill{{
+		Name: "foo", Source: "agents", Status: "enabled",
+		Path: filepath.Join(agentsRoot, "foo"),
+		Presence: map[string]string{
+			"agents": skills.PresenceReal,
+			"claude": skills.PresenceMissing,
+		},
+	}}
+	m.refreshLists()
+
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("L")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmLinkSingle {
+		t.Fatalf("expected confirmLinkSingle, got %v", nm.pendingConfirm)
+	}
+
+	next2, _ := nm.handleConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	nm2 := next2.(Model)
+	if nm2.pendingConfirm != confirmNone {
+		t.Errorf("expected confirm cleared after y, got %v", nm2.pendingConfirm)
+	}
+	if !strings.Contains(nm2.message, "linked") {
+		t.Errorf("expected linked message, got %q", nm2.message)
+	}
+
+	fi, err := os.Lstat(filepath.Join(claudeRoot, "foo"))
+	if err != nil {
+		t.Fatalf("expected symlink at claude/foo: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("expected symlink, got mode %v", fi.Mode())
+	}
+}
+
+func TestLinkChoiceDigitDispatch(t *testing.T) {
+	dir := t.TempDir()
+	agentsRoot := filepath.Join(dir, "agents", "skills")
+	claudeRoot := filepath.Join(dir, "claude", "skills")
+	codexRoot := filepath.Join(dir, "codex", "skills")
+	if err := os.MkdirAll(filepath.Join(agentsRoot, "foo"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentsRoot, "foo", "SKILL.md"),
+		[]byte("---\nname: foo\n---\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newTestModel(140, 32, nil)
+	m.sources = []skills.Source{
+		{Name: "agents", Root: agentsRoot},
+		{Name: "claude", Root: claudeRoot},
+		{Name: "codex", Root: codexRoot},
+	}
+	m.allSkills = []skills.Skill{{
+		Name: "foo", Source: "agents", Status: "enabled",
+		Path: filepath.Join(agentsRoot, "foo"),
+		Presence: map[string]string{
+			"agents": skills.PresenceReal,
+			"claude": skills.PresenceMissing,
+			"codex":  skills.PresenceMissing,
+		},
+	}}
+	m.refreshLists()
+
+	// L → confirmLinkChoice (claude is candidate 1, codex is 2 — order
+	// follows m.sources).
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("L")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmLinkChoice {
+		t.Fatalf("expected confirmLinkChoice, got %v", nm.pendingConfirm)
+	}
+
+	// Press "2" → should ln into codex, leaving claude untouched.
+	next2, _ := nm.handleConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("2")})
+	nm2 := next2.(Model)
+	if nm2.pendingConfirm != confirmNone {
+		t.Errorf("expected confirm cleared, got %v", nm2.pendingConfirm)
+	}
+
+	if _, err := os.Lstat(filepath.Join(codexRoot, "foo")); err != nil {
+		t.Fatalf("expected symlink at codex/foo: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(claudeRoot, "foo")); !os.IsNotExist(err) {
+		t.Errorf("claude/foo should not have been touched, lstat err=%v", err)
+	}
+}
+
+func TestPresenceBitmapAppearsInRow(t *testing.T) {
+	m := newTestModel(140, 32, []skills.Skill{
+		withPresence("agents", "alpha", "enabled", map[string]string{
+			"agents": skills.PresenceReal,
+			"claude": skills.PresenceLink,
+			"codex":  skills.PresenceMissing,
+		}),
+	})
+	view := m.View()
+	if !strings.Contains(view, "Ac·") {
+		t.Fatalf("expected presence bitmap Ac· in rendered view, got: %q", view)
+	}
+}
+
+// linkChoiceFixture stages a 2-candidate confirmLinkChoice (claude + codex)
+// against a real temp filesystem so y/letter/digit dispatch tests can
+// assert the resulting symlink lands at the expected root.
+func linkChoiceFixture(t *testing.T) (Model, string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	agentsRoot := filepath.Join(dir, "agents", "skills")
+	claudeRoot := filepath.Join(dir, "claude", "skills")
+	codexRoot := filepath.Join(dir, "codex", "skills")
+	if err := os.MkdirAll(filepath.Join(agentsRoot, "foo"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentsRoot, "foo", "SKILL.md"),
+		[]byte("---\nname: foo\n---\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newTestModel(140, 32, nil)
+	m.sources = []skills.Source{
+		{Name: "agents", Root: agentsRoot},
+		{Name: "claude", Root: claudeRoot},
+		{Name: "codex", Root: codexRoot},
+	}
+	m.allSkills = []skills.Skill{{
+		Name: "foo", Source: "agents", Status: "enabled",
+		Path: filepath.Join(agentsRoot, "foo"),
+		Presence: map[string]string{
+			"agents": skills.PresenceReal,
+			"claude": skills.PresenceMissing,
+			"codex":  skills.PresenceMissing,
+		},
+	}}
+	m.refreshLists()
+
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("L")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmLinkChoice {
+		t.Fatalf("setup: expected confirmLinkChoice, got %v", nm.pendingConfirm)
+	}
+	return nm, claudeRoot, codexRoot
+}
+
+func TestLinkChoiceLetterDispatchClaude(t *testing.T) {
+	m, claudeRoot, codexRoot := linkChoiceFixture(t)
+	next, _ := m.handleConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmNone {
+		t.Errorf("expected confirm cleared after 'c', got %v", nm.pendingConfirm)
+	}
+	if _, err := os.Lstat(filepath.Join(claudeRoot, "foo")); err != nil {
+		t.Fatalf("expected symlink at claude/foo: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(codexRoot, "foo")); !os.IsNotExist(err) {
+		t.Errorf("'c' should not touch codex, lstat err=%v", err)
+	}
+}
+
+func TestLinkChoiceLetterDispatchCodex(t *testing.T) {
+	m, claudeRoot, codexRoot := linkChoiceFixture(t)
+	next, _ := m.handleConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmNone {
+		t.Errorf("expected confirm cleared after 'x', got %v", nm.pendingConfirm)
+	}
+	if _, err := os.Lstat(filepath.Join(codexRoot, "foo")); err != nil {
+		t.Fatalf("expected symlink at codex/foo: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(claudeRoot, "foo")); !os.IsNotExist(err) {
+		t.Errorf("'x' should not touch claude, lstat err=%v", err)
+	}
+}
+
+func TestLinkChoiceLetterIsCaseInsensitive(t *testing.T) {
+	m, claudeRoot, _ := linkChoiceFixture(t)
+	next, _ := m.handleConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("C")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmNone {
+		t.Errorf("expected confirm cleared after 'C', got %v", nm.pendingConfirm)
+	}
+	if _, err := os.Lstat(filepath.Join(claudeRoot, "foo")); err != nil {
+		t.Fatalf("'C' should dispatch like 'c', lstat err=%v", err)
+	}
+}
+
+func TestLinkChoiceUnknownLetterCancels(t *testing.T) {
+	m, claudeRoot, codexRoot := linkChoiceFixture(t)
+	next, _ := m.handleConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("z")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmNone {
+		t.Errorf("unknown letter should cancel, got %v", nm.pendingConfirm)
+	}
+	if len(nm.pendingLinkOps) != 0 {
+		t.Errorf("expected pendingLinkOps cleared, got %d", len(nm.pendingLinkOps))
+	}
+	// Neither root should have been touched.
+	if _, err := os.Lstat(filepath.Join(claudeRoot, "foo")); !os.IsNotExist(err) {
+		t.Errorf("unknown letter should not link claude, lstat err=%v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(codexRoot, "foo")); !os.IsNotExist(err) {
+		t.Errorf("unknown letter should not link codex, lstat err=%v", err)
+	}
+}
+
+func TestLinkChoiceFooterUsesSemanticLetters(t *testing.T) {
+	m, _, _ := linkChoiceFixture(t)
+	strip := m.renderLinkChoiceStrip(140)
+	// Each candidate's hint should advertise its semantic letter, not "1"/"2".
+	if !strings.Contains(strip, "ln claude") || !strings.Contains(strip, "ln codex") {
+		t.Fatalf("footer should describe candidates by name: %q", strip)
+	}
+	// Hint keys are in lipgloss-rendered form; spot-check that the c/x
+	// glyphs both appear *and* that the digit fallbacks are NOT advertised.
+	if !strings.Contains(strip, "c") || !strings.Contains(strip, "x") {
+		t.Fatalf("footer should expose c/x letter shortcuts: %q", strip)
+	}
+}
+
+// --- t key: instant toggle ---
+
+// liveSkillFixture stages a single live skill on disk so toggle tests can
+// observe the file move without mocking ApplyOperation.
+func liveSkillFixture(t *testing.T) (Model, string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	root := filepath.Join(dir, "agents", "skills")
+	off := filepath.Join(dir, "off")
+	if err := os.MkdirAll(filepath.Join(root, "demo"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "demo", "SKILL.md"),
+		[]byte("---\nname: demo\n---\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newTestModel(140, 32, nil)
+	m.sources = []skills.Source{{Name: "agents", Root: root}}
+	m.sourceRoots = map[string]string{"agents": root}
+	m.offRoot = off
+	m.allSkills = []skills.Skill{{
+		Name: "demo", Source: "agents", Status: "enabled",
+		Path: filepath.Join(root, "demo"),
+	}}
+	m.refreshLists()
+	return m, root, off
+}
+
+func TestTKeyTogglesCursorImmediately(t *testing.T) {
+	m, root, off := liveSkillFixture(t)
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmNone {
+		t.Errorf("t should not enter any confirm flow, got %v", nm.pendingConfirm)
+	}
+	if !strings.Contains(nm.message, "disabled") {
+		t.Errorf("expected 'disabled' message, got %q", nm.message)
+	}
+	if _, err := os.Stat(filepath.Join(root, "demo")); !os.IsNotExist(err) {
+		t.Errorf("live source should have moved out of root, got err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(off, "agents", "demo", "SKILL.md")); err != nil {
+		t.Errorf("expected skill in off pool: %v", err)
+	}
+}
+
+func TestTKeyAppliesMarkedSetWhenPresent(t *testing.T) {
+	m, root, off := liveSkillFixture(t)
+	// space marks the demo row, then t commits. With marks present,
+	// t must apply the marked set, not double-toggle the cursor row.
+	m.stageCurrent()
+	if len(m.stagedOps) != 1 {
+		t.Fatalf("setup: expected 1 staged op, got %d", len(m.stagedOps))
+	}
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmNone {
+		t.Errorf("t should not confirm, got %v", nm.pendingConfirm)
+	}
+	if len(nm.stagedOps) != 0 {
+		t.Errorf("staged list should be empty after apply, got %d", len(nm.stagedOps))
+	}
+	if _, err := os.Stat(filepath.Join(root, "demo")); !os.IsNotExist(err) {
+		t.Errorf("live source should have moved out of root, got err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(off, "agents", "demo", "SKILL.md")); err != nil {
+		t.Errorf("expected skill in off pool: %v", err)
+	}
+}
+
+func TestAKeyIsUnbound(t *testing.T) {
+	m, root, off := liveSkillFixture(t)
+	m.stageCurrent()
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("A")})
+	nm := next.(Model)
+	if nm.pendingConfirm != confirmNone {
+		t.Errorf("A should not enter a confirm flow, got %v", nm.pendingConfirm)
+	}
+	if len(nm.stagedOps) != 1 {
+		t.Fatalf("A should leave marked operations untouched, got %d", len(nm.stagedOps))
+	}
+	if _, err := os.Stat(filepath.Join(root, "demo", "SKILL.md")); err != nil {
+		t.Errorf("live source should stay in place: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(off, "agents", "demo")); !os.IsNotExist(err) {
+		t.Errorf("off pool should stay empty, got err=%v", err)
+	}
+}
+
+func TestTKeyRefusesProtected(t *testing.T) {
+	m, _, _ := liveSkillFixture(t)
+	m.allSkills[0].Protected = true
+	m.refreshLists()
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	nm := next.(Model)
+	if !strings.Contains(nm.message, "protected") {
+		t.Errorf("expected protected refusal, got %q", nm.message)
 	}
 }

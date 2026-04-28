@@ -3,12 +3,37 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/catoncat/skill-toggle/internal/skills"
 	"github.com/catoncat/skill-toggle/internal/ui"
 
 	"github.com/charmbracelet/lipgloss"
 )
+
+// updateElapsed returns the wall-clock time since startUpdate fired (zero
+// when the overlay has never been opened).
+func (m Model) updateElapsed() time.Duration {
+	if m.updateStartedAt.IsZero() {
+		return 0
+	}
+	return time.Since(m.updateStartedAt)
+}
+
+// formatElapsed prints a duration like "12s" or "1m23s" — short enough to
+// fit on the footer next to other status segments.
+func formatElapsed(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	d = d.Truncate(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	mins := int(d / time.Minute)
+	secs := int((d % time.Minute) / time.Second)
+	return fmt.Sprintf("%dm%02ds", mins, secs)
+}
 
 // previewBreakpoint is the minimum width at which the right-hand preview
 // panel is shown. Below this, the layout collapses to a single column and
@@ -107,7 +132,7 @@ func (m Model) renderListPanel(width, height int) string {
 	rowWidth := width - 4
 	nameColW := ui.NameColumnWidth(skillNames(m.visibleList), rowWidth)
 	body := m.renderSkillRows(m.visibleList, m.idx, m.offset, rowWidth, nameColW, true, height-3)
-	return ui.Panel(0, title, body, width, height, true)
+	return ui.Panel(title, body, width, height, true)
 }
 
 // skillNames adapts a Skill slice into a name slice so the ui package
@@ -177,6 +202,7 @@ func (m Model) renderSkillRows(list []skills.Skill, idx, offset, rowWidth, nameC
 		filler[0] = ui.MutedText(empty)
 		return strings.Join(filler, "\n")
 	}
+	sourceNames := m.sourceNames()
 	end := offset + rows
 	if end > len(list) {
 		end = len(list)
@@ -185,7 +211,7 @@ func (m Model) renderSkillRows(list []skills.Skill, idx, offset, rowWidth, nameC
 	for i := offset; i < end; i++ {
 		s := list[i]
 		row := ui.SkillRow(
-			s.Name, s.Source, s.Description, s.DescriptionChars,
+			s.Name, s.Presence, sourceNames, s.Description, s.DescriptionChars,
 			s.Status,
 			i == idx, active, m.isStaged(s),
 			nameColW, rowWidth,
@@ -198,13 +224,24 @@ func (m Model) renderSkillRows(list []skills.Skill, idx, offset, rowWidth, nameC
 	return strings.Join(out, "\n")
 }
 
+// sourceNames extracts the names from the model's source list, in the
+// same order they were configured. The presence column relies on this
+// order to keep the a/c/x bitmap stable across re-renders.
+func (m Model) sourceNames() []string {
+	out := make([]string, len(m.sources))
+	for i, s := range m.sources {
+		out[i] = s.Name
+	}
+	return out
+}
+
 // --- right column: preview panel ---
 
 func (m Model) renderRightColumn() string {
 	w := m.rightWidth()
 	h := m.leftColumnHeight()
 	body, title := m.previewBody(w - 4)
-	return ui.Panel(3, title, body, w, h, false)
+	return ui.Panel(title, body, w, h, false)
 }
 
 // previewBody returns (body, title) for the preview panel rendered at the
@@ -323,7 +360,7 @@ func (m Model) renderFullPreview() string {
 	if len(allLines) > previewBodyHeight {
 		body += "\n" + ui.MutedText(fmt.Sprintf("Line %d–%d / %d", offset+1, end, len(allLines)))
 	}
-	panel := ui.Panel(3, title, body, m.width, bodyHeight, true)
+	panel := ui.Panel(title, body, m.width, bodyHeight, true)
 	return panel + "\n" + m.renderBottomStrip()
 }
 
@@ -374,10 +411,10 @@ func (m Model) renderStatusSegment() string {
 	enabled, disabled := m.stageCounts()
 	parts := []string{}
 	if enabled > 0 {
-		parts = append(parts, fmt.Sprintf("staged enable %d", enabled))
+		parts = append(parts, fmt.Sprintf("marked enable %d", enabled))
 	}
 	if disabled > 0 {
-		parts = append(parts, fmt.Sprintf("staged disable %d", disabled))
+		parts = append(parts, fmt.Sprintf("marked disable %d", disabled))
 	}
 	staging := ""
 	if len(parts) > 0 {
@@ -415,11 +452,12 @@ func shortSortLabel(s string) string {
 }
 
 func (m Model) renderConfirmStrip(width int) string {
+	if m.pendingConfirm == confirmLinkChoice {
+		return m.renderLinkChoiceStrip(width)
+	}
+
 	question := ""
 	switch m.pendingConfirm {
-	case confirmApply:
-		enabled, disabled := m.stageCounts()
-		question = fmt.Sprintf("Apply %d enable / %d disable?", enabled, disabled)
 	case confirmUpdate:
 		s := m.currentSkill()
 		if s == nil {
@@ -431,7 +469,18 @@ func (m Model) renderConfirmStrip(width int) string {
 		question = "Update ALL global skills?"
 	case confirmQuit:
 		enabled, disabled := m.stageCounts()
-		question = fmt.Sprintf("Quit with %d enable / %d disable staged?", enabled, disabled)
+		question = fmt.Sprintf("Quit with %d enable / %d disable marked?", enabled, disabled)
+	case confirmLinkSingle:
+		if len(m.pendingLinkOps) == 0 {
+			question = "Link?"
+		} else {
+			op := m.pendingLinkOps[0]
+			verb := "Link"
+			if op.Action == "unlink" {
+				verb = "Unlink"
+			}
+			question = fmt.Sprintf("%s %s/%s?", verb, op.TargetSource, op.SkillName)
+		}
 	}
 	prompt := ui.ConfirmPrompt(question)
 	hint := ui.KeyHint("y", "yes") + "  " + ui.KeyHint("esc", "no")
@@ -440,6 +489,47 @@ func (m Model) renderConfirmStrip(width int) string {
 		gap = 1
 	}
 	return prompt + strings.Repeat(" ", gap) + hint
+}
+
+// renderLinkChoiceStrip composes the choice footer for the
+// confirmLinkChoice flow: one "(c) ln target" or "(c) unlink target"
+// hint per pending op (using the same a/c/x letters as the presence
+// bitmap), plus an esc-to-cancel marker. Hints are trimmed from the
+// right when the strip would overflow the terminal width so the cursor
+// never wraps mid-row. Numeric 1/2/3 fallbacks are wired up in the
+// dispatcher but not advertised in the strip — keeping the footer one
+// shortcut per candidate avoids visual clutter, and users reaching for
+// the number row will discover them on first try.
+func (m Model) renderLinkChoiceStrip(width int) string {
+	if len(m.pendingLinkOps) == 0 {
+		return ui.ConfirmPrompt("Link?")
+	}
+	prompt := ui.ConfirmPrompt(fmt.Sprintf("Link / unlink %s?", m.pendingLinkOps[0].SkillName))
+	hints := make([]string, 0, len(m.pendingLinkOps)+1)
+	for _, op := range m.pendingLinkOps {
+		verb := "ln"
+		if op.Action == "unlink" {
+			verb = "unlink"
+		}
+		key := string(ui.LetterForSource(op.TargetSource))
+		hints = append(hints, ui.KeyHint(key, fmt.Sprintf("%s %s", verb, op.TargetSource)))
+	}
+	hints = append(hints, ui.KeyHint("esc", "cancel"))
+	hintsLine := strings.Join(hints, "  ")
+
+	gap := width - lipgloss.Width(prompt) - lipgloss.Width(hintsLine)
+	if gap < 1 {
+		// Drop hints from the right until the row fits.
+		for len(hints) > 0 && lipgloss.Width(prompt)+2+lipgloss.Width(hintsLine) > width {
+			hints = hints[:len(hints)-1]
+			hintsLine = strings.Join(hints, "  ")
+		}
+		gap = width - lipgloss.Width(prompt) - lipgloss.Width(hintsLine)
+		if gap < 1 {
+			gap = 1
+		}
+	}
+	return prompt + strings.Repeat(" ", gap) + hintsLine
 }
 
 // --- update screen (full-screen, modeUpdate) ---
@@ -464,7 +554,7 @@ func (m Model) renderUpdateScreen() string {
 
 	visible := m.updateVisibleLines(innerHeight, innerWidth)
 	body := strings.Join(visible, "\n")
-	panel := ui.Panel(0, title, body, m.width, panelHeight, true)
+	panel := ui.Panel(title, body, m.width, panelHeight, true)
 
 	footer := m.renderUpdateFooter()
 	return panel + "\n" + footer
@@ -533,13 +623,23 @@ func (m Model) renderUpdateFooter() string {
 	case m.updateErr != nil:
 		status = ui.StatusMessage("failed: "+m.updateErr.Error(), true)
 	case m.updateRunning:
-		status = ui.MutedText("running…  esc to cancel & close")
+		status = ui.MutedText(m.runningStatusText())
 	case m.updateExit != nil && *m.updateExit == 0:
-		status = ui.StatusMessage("done · exit 0", false)
+		status = ui.StatusMessage("done · exit 0 · "+formatElapsed(m.updateElapsed()), false)
 	case m.updateExit != nil:
-		status = ui.StatusMessage(fmt.Sprintf("failed · exit %d", *m.updateExit), true)
+		status = ui.StatusMessage(fmt.Sprintf("failed · exit %d · %s", *m.updateExit, formatElapsed(m.updateElapsed())), true)
 	default:
 		status = ui.MutedText("starting…")
+	}
+	// Surface the scroll position so users don't think the stream froze
+	// when they've scrolled up — `G` snaps back to the live tail.
+	if m.updateScrollOffset > 0 {
+		marker := ui.MutedText(fmt.Sprintf("[scrolled · %d ↑ · G to follow]", m.updateScrollOffset))
+		if status == "" {
+			status = marker
+		} else {
+			status = status + "  " + marker
+		}
 	}
 	hint := ui.KeyHint("j/k", "scroll") + "  " + ui.KeyHint("g/G", "top/bot") + "  " + ui.KeyHint("esc/q", "close")
 	gap := m.width - lipgloss.Width(status) - lipgloss.Width(hint)
@@ -547,6 +647,27 @@ func (m Model) renderUpdateFooter() string {
 		gap = 1
 	}
 	return status + strings.Repeat(" ", gap) + hint
+}
+
+// runningStatusText assembles the live footer for an in-flight update:
+//
+//	running 12s · checking 3/78 · waiting on github api 8s
+//
+// The waiting hint kicks in after ~5s of silence so users can tell a slow
+// API call apart from a hung process.
+func (m Model) runningStatusText() string {
+	parts := []string{"running " + formatElapsed(m.updateElapsed())}
+	if m.updatePhase != "" {
+		parts = append(parts, m.updatePhase)
+	}
+	if !m.updateLastLineAt.IsZero() {
+		idle := time.Since(m.updateLastLineAt)
+		if idle > 5*time.Second {
+			parts = append(parts, fmt.Sprintf("waiting on github api %s", formatElapsed(idle)))
+		}
+	}
+	parts = append(parts, "esc to cancel")
+	return strings.Join(parts, " · ")
 }
 
 // --- help screen (full-screen, takes over layout in modeHelp) ---

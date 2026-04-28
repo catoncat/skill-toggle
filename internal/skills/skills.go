@@ -17,6 +17,16 @@ const (
 	SortByDescSizeAsc  = "desc-size-asc"
 )
 
+// Presence states describe how a skill name surfaces under each live root:
+// "real" means an actual directory, "link" means a symlink to another root,
+// "missing" means no entry at all. Used by the TUI to render the source
+// column as a 3-character bitmap (a/c/x).
+const (
+	PresenceReal    = "real"
+	PresenceLink    = "link"
+	PresenceMissing = "missing"
+)
+
 var ProtectedNames = []string{".system"}
 
 // Source identifies one of the live skill roots aggregated by the tool.
@@ -47,6 +57,19 @@ type Skill struct {
 	// LockSource is the upstream `source` field from the lockfile
 	// (e.g. "vercel-labs/agent-skills"), or "" when Managed is false.
 	LockSource string
+	// LockEntry is the full .skill-lock.json record for this skill
+	// (sourceUrl, skillPath, skillFolderHash, …) when Managed=true. The
+	// freshness checker needs sourceUrl + skillPath + skillFolderHash to
+	// compare against the upstream folder SHA, so we surface the whole
+	// entry instead of cherry-picking fields onto Skill.
+	LockEntry *lockfile.Entry
+	// Presence is the per-source visibility of this skill *name* across
+	// every known live root. Keyed by source name (e.g. "agents"); values
+	// are PresenceReal / PresenceLink / PresenceMissing. Every row scanned
+	// for the same name shares the same map (filled by markPresence after
+	// the live + off pass), so the TUI can render the 3-character a/c/x
+	// bitmap from any single row without cross-referencing siblings.
+	Presence map[string]string
 }
 
 type Operation struct {
@@ -55,6 +78,22 @@ type Operation struct {
 	Direction  string // "enable" or "disable"
 	SourcePath string
 	TargetPath string
+}
+
+// LinkOp captures one symlink mutation between live roots — used to expose
+// a skill that lives under one root (agents) to another (claude) per-skill,
+// without copying the directory or moving anything. The action is "link"
+// (create a symlink at TargetPath pointing at SourcePath) or "unlink"
+// (remove the symlink at TargetPath, leaving any real directory elsewhere
+// untouched). Kept separate from Operation because the Direction language
+// of enable/disable does not extend cleanly to symlink lifecycle, and the
+// staged-then-apply queue is intentionally toggle-only.
+type LinkOp struct {
+	SkillName    string
+	Action       string // "link" or "unlink"
+	SourcePath   string // resolved path of the real skill (link only)
+	TargetPath   string // path where the symlink lives (or will live)
+	TargetSource string // name of the target source, for UI feedback
 }
 
 // ParseFrontmatter parses YAML frontmatter from a SKILL.md file.
@@ -258,7 +297,57 @@ func Scan(sources []Source, offRoot string, legacyOffPerSource ...[]string) ([]S
 	result := append(enabled, disabled...)
 	markDuplicates(result)
 	markManaged(result, sources)
+	markPresence(result, sources)
 	return result, nil
+}
+
+// markPresence fills each scanned row's Presence map with the per-source
+// visibility of that skill name. Built in two passes so a name surfaced
+// only by a disabled-pool entry still gets a complete (all-missing) map,
+// not a sparse one — the TUI then renders identical bitmaps for every
+// row sharing a name without checking siblings.
+//
+// Only "enabled" rows contribute real/link information; the disabled pool
+// describes "skills you turned off", which is orthogonal to live-root
+// visibility and would otherwise misreport a real skill as link-or-missing.
+func markPresence(scanned []Skill, sources []Source) {
+	if len(scanned) == 0 {
+		return
+	}
+
+	names := make(map[string]struct{}, len(scanned))
+	for _, s := range scanned {
+		names[s.Name] = struct{}{}
+	}
+
+	presence := make(map[string]map[string]string, len(names))
+	for name := range names {
+		m := make(map[string]string, len(sources))
+		for _, src := range sources {
+			m[src.Name] = PresenceMissing
+		}
+		presence[name] = m
+	}
+
+	for _, s := range scanned {
+		if s.Status != "enabled" {
+			continue
+		}
+		state := PresenceReal
+		if s.IsSymlink {
+			state = PresenceLink
+		}
+		presence[s.Name][s.Source] = state
+	}
+
+	for i := range scanned {
+		base := presence[scanned[i].Name]
+		cp := make(map[string]string, len(base))
+		for k, v := range base {
+			cp[k] = v
+		}
+		scanned[i].Presence = cp
+	}
 }
 
 // markManaged loads each source's .skill-lock.json (if present) and tags
@@ -285,6 +374,8 @@ func markManaged(skills []Skill, sources []Source) {
 		}
 		skills[i].Managed = true
 		skills[i].LockSource = entry.Source
+		entryCopy := entry
+		skills[i].LockEntry = &entryCopy
 	}
 }
 
@@ -422,6 +513,80 @@ func ApplyOperations(ops []Operation) error {
 		}
 	}
 	return nil
+}
+
+// PlanLink builds a LinkOp that, when applied, creates a per-skill symlink
+// at <targetRoot>/<name> pointing back at the real skill directory under
+// the row's current source. Used to surface a skill in a sibling root
+// (e.g. exposing agents/foo to ~/.claude/skills/foo) without moving or
+// duplicating files.
+func PlanLink(skill Skill, targetSource, targetRoot string) LinkOp {
+	return LinkOp{
+		SkillName:    skill.Name,
+		Action:       "link",
+		SourcePath:   skill.Path,
+		TargetPath:   filepath.Join(targetRoot, skill.Name),
+		TargetSource: targetSource,
+	}
+}
+
+// PlanUnlink builds a LinkOp that removes a symlink at <atRoot>/<name>.
+// SourcePath is empty because unlink does not need it — ApplyLinkOp only
+// touches the symlink itself and leaves any real directory under another
+// root alone.
+func PlanUnlink(skill Skill, atSource, atRoot string) LinkOp {
+	return LinkOp{
+		SkillName:    skill.Name,
+		Action:       "unlink",
+		TargetPath:   filepath.Join(atRoot, skill.Name),
+		TargetSource: atSource,
+	}
+}
+
+// ApplyLinkOp executes a planned link or unlink. Protected names are
+// refused, and unlink defends against deleting a real directory by
+// requiring TargetPath to actually be a symlink before os.Remove.
+func ApplyLinkOp(op LinkOp) error {
+	if isProtected(op.SkillName) {
+		return fmt.Errorf("%s is protected", op.SkillName)
+	}
+	switch op.Action {
+	case "link":
+		sourceInfo, err := os.Stat(op.SourcePath)
+		if err != nil || !sourceInfo.IsDir() {
+			return fmt.Errorf("source does not exist or is not a directory: %s", op.SourcePath)
+		}
+		skillMDPath := filepath.Join(op.SourcePath, "SKILL.md")
+		if mdInfo, err := os.Stat(skillMDPath); err != nil || mdInfo.IsDir() {
+			return fmt.Errorf("source does not contain SKILL.md: %s", op.SourcePath)
+		}
+		if _, err := os.Lstat(op.TargetPath); err == nil {
+			return fmt.Errorf("target already exists: %s", op.TargetPath)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("target lstat failed: %w", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(op.TargetPath), 0755); err != nil {
+			return fmt.Errorf("failed to create target directory: %w", err)
+		}
+		if err := os.Symlink(op.SourcePath, op.TargetPath); err != nil {
+			return fmt.Errorf("failed to create symlink: %w", err)
+		}
+		return nil
+	case "unlink":
+		fi, err := os.Lstat(op.TargetPath)
+		if err != nil {
+			return fmt.Errorf("target does not exist: %s", op.TargetPath)
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			return fmt.Errorf("refused: %s is not a symlink", op.TargetPath)
+		}
+		if err := os.Remove(op.TargetPath); err != nil {
+			return fmt.Errorf("failed to remove symlink: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown link action: %s", op.Action)
+	}
 }
 
 // FindSkill locates a skill in scanned results by name and (optional) source.

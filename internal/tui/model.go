@@ -1,10 +1,18 @@
 package tui
 
 import (
+	"time"
+
 	"github.com/catoncat/skill-toggle/internal/config"
+	"github.com/catoncat/skill-toggle/internal/freshness"
 	"github.com/catoncat/skill-toggle/internal/skills"
 	"github.com/catoncat/skill-toggle/internal/update"
 )
+
+// freshnessTTL bounds how long a single freshness.Result stays valid in
+// the in-memory cache. Short enough that "press F again" after an update
+// run shows fresh data; long enough that mashing F doesn't spam GitHub.
+const freshnessTTL = 5 * time.Minute
 
 // mode is the dominant top-level mode of the TUI.
 type mode string
@@ -29,11 +37,12 @@ const (
 type confirmKind string
 
 const (
-	confirmNone      confirmKind = ""
-	confirmApply     confirmKind = "apply"
-	confirmUpdate    confirmKind = "update"
-	confirmUpdateAll confirmKind = "update-all"
-	confirmQuit      confirmKind = "quit"
+	confirmNone       confirmKind = ""
+	confirmUpdate     confirmKind = "update"
+	confirmUpdateAll  confirmKind = "update-all"
+	confirmQuit       confirmKind = "quit"
+	confirmLinkSingle confirmKind = "link-single"
+	confirmLinkChoice confirmKind = "link-choice"
 )
 
 // Model holds the full TUI state. It is constructed by NewModel and consumed
@@ -62,6 +71,11 @@ type Model struct {
 	// Staged operations awaiting `A`.
 	stagedOps []skills.Operation
 
+	// pendingLinkOps holds the candidates surfaced by an `L` keystroke
+	// while a confirmLink* prompt is active. Cleared on apply / esc /
+	// any other confirm flow.
+	pendingLinkOps []skills.LinkOp
+
 	// Preview state (used by both right-pane preview and full-screen preview).
 	previewSkill   *skills.Skill
 	previewSkillMD string
@@ -87,6 +101,24 @@ type Model struct {
 	updateCancel       func()
 	updateLinesCh      <-chan update.Line
 	updateResultCh     <-chan update.Result
+	// Progress feedback so the user can tell long updates apart from a
+	// hung process. updateStartedAt is set when startUpdate fires;
+	// updateLastLineAt is bumped on every appended line so the footer
+	// can flag "no output for Ns" once it crosses ~5s. updatePhase is a
+	// short human-readable summary of the most recent line that fits
+	// the footer (e.g. "checking 3/78" or "updating baoyu-format-...").
+	updateStartedAt  time.Time
+	updateLastLineAt time.Time
+	updatePhase      string
+
+	// Freshness check (F key) state. Cached results live in memory only —
+	// closed TUI clears them — so we don't need to deal with cache files,
+	// TTLs across runs, or rate-limit-aware preheating. inflight tracks
+	// which (source/name) is currently being fetched so a second F press
+	// on the same row doesn't double-fire.
+	freshnessChecker  *freshness.Checker
+	freshnessCache    map[string]freshness.Result
+	freshnessInflight map[string]bool
 
 	// Status feedback.
 	message     string
@@ -101,13 +133,16 @@ type Model struct {
 // individual fields after construction in tests; see TUI tests.
 func NewModel() Model {
 	return Model{
-		sources:      config.Sources(),
-		sourceRoots:  config.SourceRootMap(),
-		offRoot:      config.OffRoot(),
-		legacyOff:    config.LegacyOffPerSource(),
-		mode:         modeNormal,
-		sortMode:     skills.SortByName,
-		statusFilter: filterAll,
+		sources:           config.Sources(),
+		sourceRoots:       config.SourceRootMap(),
+		offRoot:           config.OffRoot(),
+		legacyOff:         config.LegacyOffPerSource(),
+		mode:              modeNormal,
+		sortMode:          skills.SortByName,
+		statusFilter:      filterAll,
+		freshnessChecker:  freshness.NewChecker(),
+		freshnessCache:    map[string]freshness.Result{},
+		freshnessInflight: map[string]bool{},
 	}
 }
 

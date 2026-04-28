@@ -4,9 +4,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
+	"unicode"
 
+	"github.com/catoncat/skill-toggle/internal/freshness"
+	"github.com/catoncat/skill-toggle/internal/lockfile"
 	"github.com/catoncat/skill-toggle/internal/skills"
+	"github.com/catoncat/skill-toggle/internal/ui"
 	"github.com/catoncat/skill-toggle/internal/update"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -23,8 +29,30 @@ type updateLineMsg struct {
 	line update.Line
 }
 
+type freshnessCheckedMsg struct {
+	key    string
+	result freshness.Result
+	err    error
+}
+
+func freshnessCheckCmd(checker *freshness.Checker, key string, entry *lockfile.Entry) tea.Cmd {
+	return func() tea.Msg {
+		res, err := checker.Check(entry)
+		return freshnessCheckedMsg{key: key, result: res, err: err}
+	}
+}
+
 type updateDoneMsg struct {
 	result update.Result
+}
+
+// updateTickMsg fires once a second while modeUpdate is active so the
+// elapsed clock in the footer keeps moving even when npx is waiting on
+// the GitHub API and not producing new lines.
+type updateTickMsg struct{}
+
+func updateTickCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return updateTickMsg{} })
 }
 
 func scanSkillsCmd(m Model) tea.Cmd {
@@ -109,24 +137,131 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Always rescan after an update — files may have shifted.
 		return m, scanSkillsCmd(m)
 
+	case updateTickMsg:
+		// Re-arm only while the overlay is still streaming; otherwise the
+		// ticker dies naturally so we don't burn CPU after the user
+		// dismisses the overlay.
+		if m.mode == modeUpdate && m.updateRunning {
+			return m, updateTickCmd()
+		}
+		return m, nil
+
+	case freshnessCheckedMsg:
+		if m.freshnessInflight != nil {
+			delete(m.freshnessInflight, msg.key)
+		}
+		if msg.err == nil && m.freshnessCache != nil {
+			m.freshnessCache[msg.key] = msg.result
+		}
+		m.message, m.messageType = formatFreshnessStatus(msg.key, msg.result, msg.err)
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
 	return m, nil
 }
 
-// appendUpdateLine stores a streamed line and keeps the buffer bounded so
-// a runaway process doesn't grow memory unbounded.
+// appendUpdateLine stores a streamed line, keeps the buffer bounded so a
+// runaway process doesn't grow memory unbounded, and parses the line for
+// progress signals (phase + last-line timestamp) that the footer reads.
+//
+// When updateName is set (single-skill mode), it also rewrites the one
+// vercel-labs/skills line that reads "✓ All global skills are up to date"
+// — that wording is misleading when the user only updated one skill.
 func (m *Model) appendUpdateLine(l update.Line) {
+	text := l.Text
+	if m.updateName != "" && !l.IsErr {
+		text = rewriteSingleUpdateLine(text, m.updateName)
+	}
 	prefix := ""
 	if l.IsErr {
 		prefix = "[err] "
 	}
-	m.updateLines = append(m.updateLines, prefix+l.Text)
+	m.updateLines = append(m.updateLines, prefix+text)
 	const maxLines = 4096
 	if len(m.updateLines) > maxLines {
 		m.updateLines = m.updateLines[len(m.updateLines)-maxLines:]
 	}
+	// Anchor the user to the absolute line they're currently reading: when
+	// they've scrolled up, increment offset so the view stays put as new
+	// lines arrive. Offset 0 keeps following the bottom (live tail).
+	if m.updateScrollOffset > 0 {
+		m.updateScrollOffset++
+		m.clampUpdateScroll()
+	}
+	m.updateLastLineAt = time.Now()
+	if phase := parseUpdatePhase(text); phase != "" {
+		m.updatePhase = phase
+	}
+}
+
+// updateInnerHeight returns the renderable rows of the modeUpdate body
+// panel, mirroring renderUpdateScreen's dimension math so scroll bounds
+// match what the user actually sees.
+func (m Model) updateInnerHeight() int {
+	panelHeight := m.height - 1
+	if panelHeight < 4 {
+		panelHeight = 4
+	}
+	inner := panelHeight - 3 // border (2) + title row
+	if inner < 1 {
+		inner = 1
+	}
+	return inner
+}
+
+// maxUpdateScroll is the largest valid updateScrollOffset — it puts the
+// oldest line at the top of the visible window. When the buffer fits in
+// one screen, no scrolling is possible and this returns 0.
+func (m Model) maxUpdateScroll() int {
+	n := len(m.updateLines) - m.updateInnerHeight()
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+func (m *Model) clampUpdateScroll() {
+	if max := m.maxUpdateScroll(); m.updateScrollOffset > max {
+		m.updateScrollOffset = max
+	}
+	if m.updateScrollOffset < 0 {
+		m.updateScrollOffset = 0
+	}
+}
+
+// rewriteSingleUpdateLine swaps misleading "All global skills" phrasing
+// for the actual targeted skill name so single-update users don't think
+// the tool ran a global sweep.
+func rewriteSingleUpdateLine(line, name string) string {
+	if strings.Contains(line, "All global skills are up to date") {
+		return "✓ " + name + " is already up to date"
+	}
+	return line
+}
+
+// checkingProgressRe extracts X/Y from "Checking global skill 3/78: name".
+var checkingProgressRe = regexp.MustCompile(`Checking\s+global\s+skill\s+(\d+)/(\d+)`)
+
+// updatingNameRe extracts <name> from "Updating <name>..." (vercel-labs
+// emits this when a skill actually has a newer version to install).
+var updatingNameRe = regexp.MustCompile(`^\s*Updating\s+(\S+)\.\.\.`)
+
+// parseUpdatePhase extracts a short footer-friendly status from one line of
+// vercel-labs/skills output. Returns "" when the line doesn't carry phase
+// info — the caller keeps the previous phase rather than blanking it.
+func parseUpdatePhase(line string) string {
+	if m := checkingProgressRe.FindStringSubmatch(line); m != nil {
+		return "checking " + m[1] + "/" + m[2]
+	}
+	if m := updatingNameRe.FindStringSubmatch(line); m != nil {
+		return "updating " + m[1]
+	}
+	if strings.HasPrefix(strings.TrimSpace(line), "Found ") && strings.Contains(line, "update(s)") {
+		return strings.TrimSpace(line)
+	}
+	return ""
 }
 
 func (m *Model) pruneStagedOps() {
@@ -268,20 +403,19 @@ func (m Model) handleNormalKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "U":
 		m.pendingConfirm = confirmUpdateAll
 		return m, nil
-	case "A":
-		if len(m.stagedOps) == 0 {
-			m.message = "no staged operations"
-			m.messageType = "info"
-			return m, nil
+	case "F":
+		return m.startFreshnessCheck()
+	case "t":
+		if len(m.stagedOps) > 0 {
+			return m.applyAllStaged()
 		}
-		m.pendingConfirm = confirmApply
-		return m, nil
+		return m.toggleCurrent()
 	case "C":
 		if len(m.stagedOps) == 0 {
 			return m, nil
 		}
 		m.stagedOps = nil
-		m.message = "cleared staged operations"
+		m.message = "cleared marks"
 		m.messageType = "info"
 		return m, nil
 	case ".":
@@ -294,8 +428,94 @@ func (m Model) handleNormalKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.messageType = "info"
 		return m, nil
+	case "L":
+		return m.handleLinkKey()
 	}
 	return m, nil
+}
+
+// handleLinkKey is fired by `L` in normal mode. It computes per-source
+// link/unlink candidates against the cursor row's source and routes to
+// the appropriate confirm flow: zero candidates surfaces a status
+// message, one candidate uses confirmLinkSingle (y/N), and two-or-more
+// use confirmLinkChoice (numbered keys 1..N).
+func (m Model) handleLinkKey() (tea.Model, tea.Cmd) {
+	skill := m.currentSkill()
+	if skill == nil {
+		return m, nil
+	}
+	if skill.Protected {
+		m.message = fmt.Sprintf("%s is protected — link refused", skill.Name)
+		m.messageType = "error"
+		return m, nil
+	}
+	if skill.Status != "enabled" {
+		m.message = fmt.Sprintf("link only applies to enabled skills (row is %s)", skill.Status)
+		m.messageType = "error"
+		return m, nil
+	}
+
+	candidates := m.planLinkCandidates(*skill)
+	switch len(candidates) {
+	case 0:
+		m.message = "no link target — all sources covered"
+		m.messageType = "info"
+		return m, nil
+	case 1:
+		m.pendingLinkOps = candidates
+		m.pendingConfirm = confirmLinkSingle
+		return m, nil
+	default:
+		m.pendingLinkOps = candidates
+		m.pendingConfirm = confirmLinkChoice
+		return m, nil
+	}
+}
+
+// planLinkCandidates builds the list of link/unlink ops that `L` exposes
+// for a skill row. Sibling sources whose presence is "missing" become
+// link candidates (create a symlink under that root); "link" siblings
+// become unlink candidates (remove the existing symlink); "real"
+// siblings are skipped — we never overwrite an independent real dir.
+// Order follows m.sources so candidate numbering stays stable.
+func (m Model) planLinkCandidates(skill skills.Skill) []skills.LinkOp {
+	out := make([]skills.LinkOp, 0, len(m.sources))
+	for _, src := range m.sources {
+		if src.Name == skill.Source {
+			continue
+		}
+		switch skill.Presence[src.Name] {
+		case skills.PresenceMissing:
+			out = append(out, skills.PlanLink(skill, src.Name, src.Root))
+		case skills.PresenceLink:
+			out = append(out, skills.PlanUnlink(skill, src.Name, src.Root))
+		}
+	}
+	return out
+}
+
+// applyPendingLink dispatches one of the staged link/unlink ops, writes
+// a status message, and triggers a rescan so Presence maps catch up.
+func (m Model) applyPendingLink(idx int) (tea.Model, tea.Cmd) {
+	if idx < 0 || idx >= len(m.pendingLinkOps) {
+		m.pendingLinkOps = nil
+		return m, nil
+	}
+	op := m.pendingLinkOps[idx]
+	m.pendingLinkOps = nil
+	if err := skills.ApplyLinkOp(op); err != nil {
+		m.message = fmt.Sprintf("link failed: %v", err)
+		m.messageType = "error"
+		return m, scanSkillsCmd(m)
+	}
+	switch op.Action {
+	case "link":
+		m.message = fmt.Sprintf("linked %s/%s", op.TargetSource, op.SkillName)
+	case "unlink":
+		m.message = fmt.Sprintf("unlinked %s/%s", op.TargetSource, op.SkillName)
+	}
+	m.messageType = "info"
+	return m, scanSkillsCmd(m)
 }
 
 // --- search mode ---
@@ -419,20 +639,51 @@ func (m Model) dismissHelp() (tea.Model, tea.Cmd) {
 // --- confirm dispatch ---
 
 func (m Model) handleConfirmKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	pending := m.pendingConfirm
+
 	if key.Type == tea.KeyEsc {
 		m.pendingConfirm = confirmNone
-		return m, nil
-	}
-	if key.String() != "y" && key.String() != "Y" {
-		m.pendingConfirm = confirmNone
+		m.pendingLinkOps = nil
 		return m, nil
 	}
 
-	pending := m.pendingConfirm
+	// Choice menu for link / unlink: semantic letters (c=claude, x=codex,
+	// a=agents — matches the presence bitmap) take priority, with 1/2/3
+	// kept as a positional fallback for users who reach for the number row.
+	// Anything that doesn't match a candidate cancels the prompt, in keeping
+	// with the "esc to bail" feel of the confirm flow.
+	if pending == confirmLinkChoice {
+		s := key.String()
+		if len(s) == 1 {
+			ch := rune(s[0])
+			lower := unicode.ToLower(ch)
+			for i, op := range m.pendingLinkOps {
+				if ui.LetterForSource(op.TargetSource) == lower {
+					m.pendingConfirm = confirmNone
+					return m.applyPendingLink(i)
+				}
+			}
+			if ch >= '1' && ch <= '9' {
+				idx := int(ch - '1')
+				if idx < len(m.pendingLinkOps) {
+					m.pendingConfirm = confirmNone
+					return m.applyPendingLink(idx)
+				}
+			}
+		}
+		m.pendingConfirm = confirmNone
+		m.pendingLinkOps = nil
+		return m, nil
+	}
+
+	if key.String() != "y" && key.String() != "Y" {
+		m.pendingConfirm = confirmNone
+		m.pendingLinkOps = nil
+		return m, nil
+	}
+
 	m.pendingConfirm = confirmNone
 	switch pending {
-	case confirmApply:
-		return m.applyAllStaged()
 	case confirmUpdate:
 		s := m.currentSkill()
 		if s == nil {
@@ -443,8 +694,87 @@ func (m Model) handleConfirmKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.startUpdate("")
 	case confirmQuit:
 		return m, tea.Quit
+	case confirmLinkSingle:
+		return m.applyPendingLink(0)
 	}
 	return m, nil
+}
+
+// startFreshnessCheck runs the F-key flow: validate the current row is a
+// managed skill with a lockfile entry, hit the in-memory TTL cache, and
+// fall back to a non-blocking GitHub Contents API request whose result
+// arrives later as freshnessCheckedMsg. The status message line carries
+// every outcome (cache hit, in-flight dedup, success, every error mode)
+// so we don't need a dedicated overlay for what is one HTTP call.
+func (m Model) startFreshnessCheck() (tea.Model, tea.Cmd) {
+	s := m.currentSkill()
+	if s == nil {
+		return m, nil
+	}
+	if !s.Managed {
+		m.message = fmt.Sprintf("%s/%s not managed by `npx skills add` — nothing to check", s.Source, s.Name)
+		m.messageType = "error"
+		return m, nil
+	}
+	if s.LockEntry == nil {
+		m.message = fmt.Sprintf("%s/%s: missing lockfile entry", s.Source, s.Name)
+		m.messageType = "error"
+		return m, nil
+	}
+
+	key := s.Source + "/" + s.Name
+	if cached, ok := m.freshnessCache[key]; ok && time.Since(cached.CheckedAt) < freshnessTTL {
+		m.message, m.messageType = formatFreshnessStatus(key, cached, nil)
+		return m, nil
+	}
+	if m.freshnessInflight[key] {
+		m.message = fmt.Sprintf("%s: check already in progress", key)
+		m.messageType = "info"
+		return m, nil
+	}
+	if m.freshnessChecker == nil || m.freshnessInflight == nil {
+		// Defensive: tests can construct a bare Model without going through
+		// NewModel, in which case the freshness machinery is unwired.
+		m.message = "freshness check unavailable"
+		m.messageType = "error"
+		return m, nil
+	}
+
+	m.freshnessInflight[key] = true
+	m.message = fmt.Sprintf("checking %s upstream sha…", key)
+	m.messageType = "info"
+	return m, freshnessCheckCmd(m.freshnessChecker, key, s.LockEntry)
+}
+
+// formatFreshnessStatus turns a freshness.Result + error pair into the
+// (message, messageType) pair the bottom strip wants. Used both for fresh
+// API responses and cached hits so the wording stays identical.
+func formatFreshnessStatus(key string, r freshness.Result, err error) (string, string) {
+	if err != nil {
+		switch err {
+		case freshness.ErrRateLimited:
+			return fmt.Sprintf("%s: github rate limited — set GH_TOKEN or GITHUB_TOKEN to lift the 60/h anonymous cap", key), "error"
+		case freshness.ErrNotFound:
+			return fmt.Sprintf("%s: upstream folder not found (lockfile path may be stale)", key), "error"
+		case freshness.ErrUnsupported:
+			return fmt.Sprintf("%s: source url not supported (only github.com)", key), "error"
+		case freshness.ErrNoLockEntry:
+			return fmt.Sprintf("%s: missing lockfile entry", key), "error"
+		}
+		return fmt.Sprintf("%s: check failed: %v", key, err), "error"
+	}
+	if r.UpToDate {
+		return fmt.Sprintf("%s: up to date (sha %s)", key, shortSHA(r.RemoteSHA)), "info"
+	}
+	return fmt.Sprintf("%s: new version available — press u to update (local %s → remote %s)",
+		key, shortSHA(r.LocalSHA), shortSHA(r.RemoteSHA)), "info"
+}
+
+func shortSHA(s string) string {
+	if len(s) > 8 {
+		return s[:8]
+	}
+	return s
 }
 
 // startUpdate kicks off `npx skills update` for one or all skills, switches
@@ -455,10 +785,19 @@ func (m Model) startUpdate(name string) (tea.Model, tea.Cmd) {
 	m.mode = modeUpdate
 	m.updateName = name
 	m.updateLines = nil
+	if name != "" {
+		// Banner makes the scope obvious before vercel-labs/skills prints
+		// "All global skills..." which sounds like a sweep otherwise.
+		m.updateLines = append(m.updateLines, "→ scope: single skill ("+name+")")
+	}
 	m.updateRunning = true
 	m.updateExit = nil
 	m.updateErr = nil
 	m.updateScrollOffset = 0
+	m.updatePhase = ""
+	now := time.Now()
+	m.updateStartedAt = now
+	m.updateLastLineAt = now
 
 	lines, result, cancel, err := update.Start(name)
 	if err != nil {
@@ -469,30 +808,45 @@ func (m Model) startUpdate(name string) (tea.Model, tea.Cmd) {
 	m.updateLinesCh = lines
 	m.updateResultCh = result
 	m.updateCancel = cancel
-	return m, waitUpdateCmd(lines, result)
+	// Batch the streaming wait with a 1s ticker so the elapsed clock and
+	// "no output for Ns" hint stay live even when npx is blocked on a
+	// GitHub API call (which is most of the time during the checking phase).
+	return m, tea.Batch(waitUpdateCmd(lines, result), updateTickCmd())
 }
 
 // handleUpdateKey services keypresses while the update overlay is active.
+//
+// Scroll model: updateScrollOffset is the number of lines we've scrolled
+// up from the bottom (the live tail). 0 follows the bottom; values above
+// 0 freeze the view on a specific absolute line. Bounds are kept tight in
+// clampUpdateScroll so the user can't accidentally scroll past either
+// edge into an empty panel.
 func (m Model) handleUpdateKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	page := m.updateInnerHeight()
 	switch key.Type {
 	case tea.KeyEsc:
 		return m.closeUpdateOverlay(), nil
 	case tea.KeyUp:
 		m.updateScrollOffset++
+		m.clampUpdateScroll()
 		return m, nil
 	case tea.KeyDown:
-		if m.updateScrollOffset > 0 {
-			m.updateScrollOffset--
-		}
+		m.updateScrollOffset--
+		m.clampUpdateScroll()
 		return m, nil
 	case tea.KeyPgUp, tea.KeyCtrlU:
-		m.updateScrollOffset += 10
+		m.updateScrollOffset += page
+		m.clampUpdateScroll()
 		return m, nil
 	case tea.KeyPgDown, tea.KeyCtrlD:
-		m.updateScrollOffset -= 10
-		if m.updateScrollOffset < 0 {
-			m.updateScrollOffset = 0
-		}
+		m.updateScrollOffset -= page
+		m.clampUpdateScroll()
+		return m, nil
+	case tea.KeyHome:
+		m.updateScrollOffset = m.maxUpdateScroll()
+		return m, nil
+	case tea.KeyEnd:
+		m.updateScrollOffset = 0
 		return m, nil
 	}
 	switch key.String() {
@@ -500,14 +854,14 @@ func (m Model) handleUpdateKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.closeUpdateOverlay(), nil
 	case "k":
 		m.updateScrollOffset++
+		m.clampUpdateScroll()
 		return m, nil
 	case "j":
-		if m.updateScrollOffset > 0 {
-			m.updateScrollOffset--
-		}
+		m.updateScrollOffset--
+		m.clampUpdateScroll()
 		return m, nil
 	case "g":
-		m.updateScrollOffset = len(m.updateLines)
+		m.updateScrollOffset = m.maxUpdateScroll()
 		return m, nil
 	case "G":
 		m.updateScrollOffset = 0
@@ -557,7 +911,7 @@ func (m *Model) stageCurrent() {
 	for i, op := range m.stagedOps {
 		if op.Source == skill.Source && op.SkillName == skill.Name {
 			m.stagedOps = append(m.stagedOps[:i], m.stagedOps[i+1:]...)
-			m.message = fmt.Sprintf("unstaged %s/%s", skill.Source, skill.Name)
+			m.message = fmt.Sprintf("unmarked %s/%s", skill.Source, skill.Name)
 			m.messageType = "info"
 			return
 		}
@@ -569,8 +923,37 @@ func (m *Model) stageCurrent() {
 	}
 	op := skills.PlanOperation(*skill, m.sourceRoots[skill.Source], m.offRoot)
 	m.stagedOps = append(m.stagedOps, op)
-	m.message = fmt.Sprintf("staged %s %s/%s", op.Direction, skill.Source, skill.Name)
+	m.message = fmt.Sprintf("marked %s %s/%s", op.Direction, skill.Source, skill.Name)
 	m.messageType = "info"
+}
+
+// toggleCurrent flips the cursor row's skill immediately, with no
+// staged-list detour. Used by `t` when nothing is selected — the user's
+// mental model is "one action, applied to either the cursor row or the
+// space-marked rows", so single-row toggle never needs the queue.
+func (m Model) toggleCurrent() (tea.Model, tea.Cmd) {
+	skill := m.currentSkill()
+	if skill == nil {
+		return m, nil
+	}
+	if skill.Protected {
+		m.message = fmt.Sprintf("%s is protected and cannot be toggled", skill.Name)
+		m.messageType = "error"
+		return m, nil
+	}
+	op := skills.PlanOperation(*skill, m.sourceRoots[skill.Source], m.offRoot)
+	if err := skills.ApplyOperation(op); err != nil {
+		m.message = fmt.Sprintf("failed: %s/%s — %v", op.Source, op.SkillName, err)
+		m.messageType = "error"
+		return m, scanSkillsCmd(m)
+	}
+	if op.Direction == "enable" {
+		m.message = fmt.Sprintf("enabled %s/%s", op.Source, op.SkillName)
+	} else {
+		m.message = fmt.Sprintf("disabled %s/%s", op.Source, op.SkillName)
+	}
+	m.messageType = "info"
+	return m, scanSkillsCmd(m)
 }
 
 func (m Model) applyAllStaged() (tea.Model, tea.Cmd) {
@@ -602,7 +985,7 @@ func (m Model) applyAllStaged() (tea.Model, tea.Cmd) {
 	if disabled > 0 {
 		parts = append(parts, fmt.Sprintf("disabled %d", disabled))
 	}
-	m.message = fmt.Sprintf("applied: %s", strings.Join(parts, ", "))
+	m.message = fmt.Sprintf("toggled: %s", strings.Join(parts, ", "))
 	m.messageType = "info"
 	return m, scanSkillsCmd(m)
 }
