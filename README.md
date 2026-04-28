@@ -1,8 +1,10 @@
 # skill-toggle
 
-`skill-toggle` is a small terminal UI for enabling and disabling local agent skills across the three live skill roots used by Codex/Claude/agents-style tooling.
+[中文说明](README.zh-CN.md)
 
-It aggregates skills from `~/.agents/skills`, `~/.claude/skills`, and `~/.codex/skills` into one view, lets you stage toggles, and applies them as folder moves between each source root and a single global off directory.
+`skill-toggle` is a small terminal UI for enabling, disabling, updating, and linking local agent skills across the three live skill roots used by Codex/Claude/agents-style tooling.
+
+It aggregates skills from `~/.agents/skills`, `~/.claude/skills`, and `~/.codex/skills` into one view, lets you mark toggles, applies them as folder moves between each source root and a single global off directory, and can expose one real skill folder to sibling roots through safe per-skill symlinks.
 
 ## Screenshots
 
@@ -18,14 +20,27 @@ It aggregates skills from `~/.agents/skills`, `~/.claude/skills`, and `~/.codex/
 
 <img src="docs/assets/help.png" alt="skill-toggle help overlay" width="900">
 
+## Highlights
+
+- One TUI for the Agents, Claude, and Codex skill roots — no profile switching.
+- Symlink-aware by default: hides duplicate rows when one source root points at another, while `.` / `--show-linked` can reveal every row.
+- Per-skill linking with `L`: expose one real skill folder to another root through a symlink, or unlink an existing symlink without touching the real folder.
+- Safe toggles: enable/disable uses `os.Rename`, refuses overwrites, and protects `.system`.
+- Managed update guard: reads `.skill-lock.json` and refuses one-off updates for hand-placed skills that `npx skills update` cannot safely refresh.
+- Upstream freshness check with `F`: checks whether a managed skill is behind its upstream hash without installing anything.
+- Fast narrowing: `a` / `e` / `d` filters, text search, description-size sorting, and inline/full-screen SKILL.md preview.
+- Scriptable CLI for listing, filtering, enabling, disabling, and updating skills.
+
 ## What It Does
 
 - Aggregates skills across all three live roots — no profile to pick.
 - Lazygit-style TUI: a single skill list on the left filterable by `a` (all) / `e` (enabled) / `d` (disabled), with a SKILL.md preview on the right.
 - Marks multiple toggles with `Space`, then applies the marked batch with `t`; with no marks, `t` toggles the current row immediately.
+- Links or unlinks an enabled skill into sibling roots with `L`, using symlinks instead of copies.
 - Searches by name, source, or description.
 - Sorts by name, description size descending, or description size ascending.
-- Runs `npx skills update` for one enabled skill or all global skills.
+- Runs `npx skills update` for one enabled managed skill or all global skills.
+- Checks a managed skill's upstream freshness without installing updates.
 - Avoids deletion: toggling only renames/moves folders or symlinks.
 
 ## Install
@@ -103,7 +118,13 @@ skill-toggle update --all
 
 ### Symlinked source roots
 
-If `~/.claude/skills` is a symlink to `~/.agents/skills` (a common setup), every skill would otherwise show up twice — once per source. By default the tool resolves canonical paths and hides the duplicates, anchoring on the earliest source listed (agents → claude → codex). Pass `--show-linked` (CLI) or press `.` (TUI) to see every source's row.
+If `~/.claude/skills` is a symlink to `~/.agents/skills` (a common setup), every skill would otherwise show up twice — once per source. By default the tool resolves canonical paths and hides the duplicates, anchoring on the earliest source listed (agents → claude → codex). Pass `--show-linked` (CLI) or press `.` (TUI) to see every source's row; symlink rows are marked with `@` in CLI output.
+
+### Per-skill links
+
+Press `L` on an enabled skill to link or unlink that skill across sibling roots. Missing sibling roots become link candidates, which create `<target-root>/<name>` as a symlink to the current real skill folder. Existing symlink siblings become unlink candidates, which remove only the symlink and leave the real folder untouched.
+
+The link flow refuses disabled rows, protected names such as `.system`, existing targets, missing `SKILL.md`, and attempts to unlink a real directory. If more than one target is available, the confirmation strip uses the source letters (`a` / `c` / `x`) plus numeric fallbacks.
 
 ### Managed vs hand-placed skills
 
