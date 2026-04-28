@@ -13,3 +13,8 @@ dist/
 *.out
 *.test
 
+# Local editor / agent config
+/.claude/
+/.vscode/
+/.github/copilot-instructions.md
+
