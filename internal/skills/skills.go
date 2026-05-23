@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/catoncat/skill-toggle/internal/lockfile"
 )
@@ -28,6 +29,8 @@ const (
 )
 
 var ProtectedNames = []string{".system"}
+
+var now = time.Now
 
 // Source identifies one of the live skill roots aggregated by the tool.
 type Source struct {
@@ -474,11 +477,14 @@ func ApplyOperation(op Operation) error {
 			if cmpErr != nil {
 				return fmt.Errorf("target already exists at %s and could not be compared: %w", op.TargetPath, cmpErr)
 			}
-			if !same {
-				return fmt.Errorf("target already exists at %s and SKILL.md differs from live source — inspect and remove manually", op.TargetPath)
-			}
-			if err := os.RemoveAll(op.TargetPath); err != nil {
-				return fmt.Errorf("failed to remove stale off entry %s: %w", op.TargetPath, err)
+			if same {
+				if err := os.RemoveAll(op.TargetPath); err != nil {
+					return fmt.Errorf("failed to remove stale off entry %s: %w", op.TargetPath, err)
+				}
+			} else {
+				if _, err := quarantineOffConflict(op); err != nil {
+					return err
+				}
 			}
 		} else {
 			return fmt.Errorf("target already exists: %s", op.TargetPath)
@@ -490,6 +496,38 @@ func ApplyOperation(op Operation) error {
 	}
 
 	return nil
+}
+
+func quarantineOffConflict(op Operation) (string, error) {
+	// TargetPath is <offRoot>/<source>/<name>; keep conflicts beside offRoot
+	// so the normal disabled scan does not keep treating them as state.
+	offRoot := filepath.Dir(filepath.Dir(op.TargetPath))
+	configDir := filepath.Dir(offRoot)
+	stamp := now().Format("20060102-150405")
+	base := filepath.Join(configDir, "off-conflicts-"+stamp, op.Source)
+
+	var quarantinePath string
+	for i := 0; i < 100; i++ {
+		name := op.SkillName
+		if i > 0 {
+			name = fmt.Sprintf("%s-%02d", op.SkillName, i)
+		}
+		candidate := filepath.Join(base, name)
+		if _, err := os.Lstat(candidate); os.IsNotExist(err) {
+			quarantinePath = candidate
+			break
+		}
+	}
+	if quarantinePath == "" {
+		return "", fmt.Errorf("failed to choose conflict quarantine path for %s", op.TargetPath)
+	}
+	if err := os.MkdirAll(filepath.Dir(quarantinePath), 0755); err != nil {
+		return "", fmt.Errorf("failed to create conflict quarantine directory: %w", err)
+	}
+	if err := os.Rename(op.TargetPath, quarantinePath); err != nil {
+		return "", fmt.Errorf("failed to quarantine stale off entry %s to %s: %w", op.TargetPath, quarantinePath, err)
+	}
+	return quarantinePath, nil
 }
 
 func sameSkillMD(aDir, bDir string) (bool, error) {

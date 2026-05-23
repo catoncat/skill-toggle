@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeSkill(t *testing.T, root, name, description string) {
@@ -313,15 +314,20 @@ func TestApplyOperationRefusesProtected(t *testing.T) {
 	}
 }
 
-func TestApplyOperationRefusesExistingTarget(t *testing.T) {
+func TestApplyOperationQuarantinesDifferentStaleOff(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, "skills")
 	off := filepath.Join(dir, "off", "agents")
 	writeSkill(t, root, "dup", "original")
 	os.MkdirAll(filepath.Join(off, "dup"), 0755)
-	// Stale off SKILL.md differs from live source — must refuse to avoid
-	// silent data loss.
+	// Stale off SKILL.md differs from live source. Live is the active truth,
+	// so the stale off copy should be quarantined, not allowed to block the
+	// requested disable.
 	os.WriteFile(filepath.Join(off, "dup", "SKILL.md"), []byte("---\nname: dup\ndescription: stale\n---\n"), 0644)
+
+	oldNow := now
+	now = func() time.Time { return time.Date(2026, 5, 23, 12, 34, 56, 0, time.UTC) }
+	t.Cleanup(func() { now = oldNow })
 
 	op := Operation{
 		SkillName:  "dup",
@@ -330,12 +336,23 @@ func TestApplyOperationRefusesExistingTarget(t *testing.T) {
 		SourcePath: filepath.Join(root, "dup"),
 		TargetPath: filepath.Join(off, "dup"),
 	}
-	err := ApplyOperation(op)
-	if err == nil {
-		t.Fatal("expected refusal when stale off SKILL.md differs from live source")
+	if err := ApplyOperation(op); err != nil {
+		t.Fatalf("expected stale off quarantine to succeed, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "differs") {
-		t.Fatalf("expected error to mention SKILL.md diff, got: %v", err)
+	got, err := os.ReadFile(filepath.Join(off, "dup", "SKILL.md"))
+	if err != nil {
+		t.Fatalf("expected live source to be moved into off: %v", err)
+	}
+	if !strings.Contains(string(got), "original") {
+		t.Fatalf("expected normal off entry to contain live source, got: %s", got)
+	}
+	quarantined := filepath.Join(dir, "off-conflicts-20260523-123456", "agents", "dup", "SKILL.md")
+	got, err = os.ReadFile(quarantined)
+	if err != nil {
+		t.Fatalf("expected stale off entry to be quarantined at %s: %v", quarantined, err)
+	}
+	if !strings.Contains(string(got), "stale") {
+		t.Fatalf("expected quarantined entry to contain stale off copy, got: %s", got)
 	}
 }
 
