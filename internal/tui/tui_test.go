@@ -107,9 +107,9 @@ func TestStageCurrentTogglesAndUnstages(t *testing.T) {
 	if m.stagedOps[0].Direction != "disable" {
 		t.Errorf("expected disable, got %s", m.stagedOps[0].Direction)
 	}
-	expectedTarget := filepath.Join("/tmp/off", "agents", "demo")
-	if m.stagedOps[0].TargetPath != expectedTarget {
-		t.Errorf("unexpected target %s", m.stagedOps[0].TargetPath)
+	// Frontmatter-based: TargetPath should be empty (no physical move).
+	if m.stagedOps[0].TargetPath != "" {
+		t.Errorf("unexpected target %s, expected empty (frontmatter-based)", m.stagedOps[0].TargetPath)
 	}
 	m.stageCurrent()
 	if len(m.stagedOps) != 0 {
@@ -1114,11 +1114,25 @@ func TestTKeyTogglesCursorImmediately(t *testing.T) {
 	if !strings.Contains(nm.message, "disabled") {
 		t.Errorf("expected 'disabled' message, got %q", nm.message)
 	}
-	if _, err := os.Stat(filepath.Join(root, "demo")); !os.IsNotExist(err) {
-		t.Errorf("live source should have moved out of root, got err=%v", err)
+	// Frontmatter-based: skill stays in live root.
+	if _, err := os.Stat(filepath.Join(root, "demo", "SKILL.md")); err != nil {
+		t.Errorf("live source should remain in root: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(off, "agents", "demo", "SKILL.md")); err != nil {
-		t.Errorf("expected skill in off pool: %v", err)
+	// Should have frontmatter flag.
+	data, err := os.ReadFile(filepath.Join(root, "demo", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "disable-model-invocation: true") {
+		t.Error("expected disable-model-invocation: true in SKILL.md")
+	}
+	// Should have agents/openai.yaml.
+	if _, err := os.Stat(filepath.Join(root, "demo", "agents", "openai.yaml")); err != nil {
+		t.Errorf("expected agents/openai.yaml: %v", err)
+	}
+	// Should NOT be in off pool.
+	if _, err := os.Stat(filepath.Join(off, "agents", "demo")); !os.IsNotExist(err) {
+		t.Error("skill should not be moved to off pool")
 	}
 }
 
@@ -1138,11 +1152,19 @@ func TestTKeyAppliesMarkedSetWhenPresent(t *testing.T) {
 	if len(nm.stagedOps) != 0 {
 		t.Errorf("staged list should be empty after apply, got %d", len(nm.stagedOps))
 	}
-	if _, err := os.Stat(filepath.Join(root, "demo")); !os.IsNotExist(err) {
-		t.Errorf("live source should have moved out of root, got err=%v", err)
+	// Frontmatter-based: skill stays in live root.
+	if _, err := os.Stat(filepath.Join(root, "demo", "SKILL.md")); err != nil {
+		t.Errorf("live source should remain in root: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(off, "agents", "demo", "SKILL.md")); err != nil {
-		t.Errorf("expected skill in off pool: %v", err)
+	data, err := os.ReadFile(filepath.Join(root, "demo", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "disable-model-invocation: true") {
+		t.Error("expected disable-model-invocation: true in SKILL.md")
+	}
+	if _, err := os.Stat(filepath.Join(off, "agents", "demo")); !os.IsNotExist(err) {
+		t.Error("skill should not be moved to off pool")
 	}
 }
 

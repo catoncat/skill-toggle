@@ -122,7 +122,7 @@ func newListCommand(opts *options) *cobra.Command {
 func newEnableCommand(opts *options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "enable NAME",
-		Short: "Move a disabled skill back into its source root.",
+		Short: "Restore a muted skill's auto-invocation.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := validateOpts(opts); err != nil {
@@ -136,7 +136,7 @@ func newEnableCommand(opts *options) *cobra.Command {
 func newDisableCommand(opts *options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "disable NAME",
-		Short: "Move an enabled skill into the global off directory.",
+		Short: "Mute a skill's auto-invocation (writes frontmatter + openai.yaml).",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := validateOpts(opts); err != nil {
@@ -238,7 +238,7 @@ func enableSkill(cmd *cobra.Command, name, source string) error {
 		return err
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "%s/%s: disabled -> enabled\n", skill.Source, skill.Name)
-	fmt.Fprintln(cmd.OutOrStdout(), "Restart Codex/Claude to load the enabled skill.")
+	fmt.Fprintln(cmd.OutOrStdout(), "Skill auto-invocation restored. Changes apply on next skill scan.")
 	return nil
 }
 
@@ -256,7 +256,7 @@ func disableSkill(cmd *cobra.Command, name, source string) error {
 		return err
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "%s/%s: enabled -> disabled\n", skill.Source, skill.Name)
-	fmt.Fprintln(cmd.OutOrStdout(), "Restart Codex/Claude to apply the disabled skill.")
+	fmt.Fprintln(cmd.OutOrStdout(), "Skill auto-invocation muted. Use /skill or $skill to invoke explicitly.")
 	return nil
 }
 

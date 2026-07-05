@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func writeSkill(t *testing.T, root, name, description string) {
@@ -40,7 +39,7 @@ func TestParseFrontmatter(t *testing.T) {
 	dir := t.TempDir()
 	writeSkill(t, dir, "demo", "Demo description.")
 
-	name, desc, err := ParseFrontmatter(filepath.Join(dir, "demo", "SKILL.md"))
+	name, desc, _, err := ParseFrontmatter(filepath.Join(dir, "demo", "SKILL.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +55,7 @@ func TestParseFoldedDescription(t *testing.T) {
 	dir := t.TempDir()
 	writeFoldedSkill(t, dir, "folded", "first line", "second line")
 
-	name, desc, err := ParseFrontmatter(filepath.Join(dir, "folded", "SKILL.md"))
+	name, desc, _, err := ParseFrontmatter(filepath.Join(dir, "folded", "SKILL.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +73,7 @@ func TestParseFrontmatterMissing(t *testing.T) {
 	os.MkdirAll(dirPath, 0755)
 	os.WriteFile(filepath.Join(dirPath, "SKILL.md"), []byte("# Just a heading\n"), 0644)
 
-	name, _, err := ParseFrontmatter(filepath.Join(dirPath, "SKILL.md"))
+	name, _, _, err := ParseFrontmatter(filepath.Join(dirPath, "SKILL.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +89,7 @@ func TestParseFrontmatterQuotedName(t *testing.T) {
 	os.WriteFile(filepath.Join(dirPath, "SKILL.md"),
 		[]byte("---\nname: \"Display Name\"\ndescription: A description\n---\n"), 0644)
 
-	name, desc, err := ParseFrontmatter(filepath.Join(dirPath, "SKILL.md"))
+	name, desc, _, err := ParseFrontmatter(filepath.Join(dirPath, "SKILL.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,12 +285,56 @@ func TestPlanAndApplyOperations(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := os.Stat(filepath.Join(agentsRoot, "toggle-me")); !os.IsNotExist(err) {
-		t.Error("skill should have been moved out of agents root")
+	// Skill should remain in the live root (no physical move).
+	if _, err := os.Stat(filepath.Join(agentsRoot, "toggle-me", "SKILL.md")); err != nil {
+		t.Errorf("skill should still exist in live root: %v", err)
 	}
-	target := filepath.Join(off, "agents", "toggle-me", "SKILL.md")
-	if _, err := os.Stat(target); err != nil {
-		t.Errorf("skill should exist at %s: %v", target, err)
+	// SKILL.md should have disable-model-invocation: true in frontmatter.
+	skillMD := filepath.Join(agentsRoot, "toggle-me", "SKILL.md")
+	if !IsDisabledByFrontmatter(skillMD) {
+		t.Error("expected disable-model-invocation: true in SKILL.md")
+	}
+	// agents/openai.yaml should exist with allow_implicit_invocation: false.
+	if !HasOpenaiYAMLDisabled(filepath.Join(agentsRoot, "toggle-me")) {
+		t.Error("expected agents/openai.yaml with allow_implicit_invocation: false")
+	}
+}
+
+func TestApplyOperationEnableRemovesFrontmatter(t *testing.T) {
+	dir := t.TempDir()
+	agentsRoot := filepath.Join(dir, "agents-skills")
+	off := filepath.Join(dir, "off")
+
+	writeSkill(t, agentsRoot, "muted", "A muted skill.")
+	skillMD := filepath.Join(agentsRoot, "muted", "SKILL.md")
+	if err := SetDisableModelInvocation(skillMD); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateOpenaiYAML(filepath.Join(agentsRoot, "muted")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Scan should report it as disabled.
+	sources := []Source{{Name: "agents", Root: agentsRoot}}
+	all, err := Scan(sources, off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if all[0].Status != "disabled" {
+		t.Fatalf("expected disabled status, got %s", all[0].Status)
+	}
+
+	// Enable should remove frontmatter + openai.yaml.
+	ops := PlanOperations(all, map[string]string{"agents": agentsRoot}, off)
+	if err := ApplyOperations(ops); err != nil {
+		t.Fatal(err)
+	}
+
+	if IsDisabledByFrontmatter(skillMD) {
+		t.Error("expected disable-model-invocation to be removed")
+	}
+	if HasOpenaiYAMLDisabled(filepath.Join(agentsRoot, "muted")) {
+		t.Error("expected agents/openai.yaml to be removed")
 	}
 }
 
@@ -314,77 +357,75 @@ func TestApplyOperationRefusesProtected(t *testing.T) {
 	}
 }
 
-func TestApplyOperationQuarantinesDifferentStaleOff(t *testing.T) {
+func TestApplyOperationEnableFromOffDirMovesBack(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, "skills")
 	off := filepath.Join(dir, "off", "agents")
-	writeSkill(t, root, "dup", "original")
-	os.MkdirAll(filepath.Join(off, "dup"), 0755)
-	// Stale off SKILL.md differs from live source. Live is the active truth,
-	// so the stale off copy should be quarantined, not allowed to block the
-	// requested disable.
-	os.WriteFile(filepath.Join(off, "dup", "SKILL.md"), []byte("---\nname: dup\ndescription: stale\n---\n"), 0644)
+	writeSkill(t, off, "legacy", "was in off dir")
 
-	oldNow := now
-	now = func() time.Time { return time.Date(2026, 5, 23, 12, 34, 56, 0, time.UTC) }
-	t.Cleanup(func() { now = oldNow })
-
-	op := Operation{
-		SkillName:  "dup",
-		Source:     "agents",
-		Direction:  "disable",
-		SourcePath: filepath.Join(root, "dup"),
-		TargetPath: filepath.Join(off, "dup"),
+	// Simulate a disabled skill found in the off directory.
+	skill := Skill{
+		Name:     "legacy",
+		Source:   "agents",
+		Status:   "disabled",
+		Path:     filepath.Join(off, "legacy"),
+		IsOffDir: true,
 	}
+	op := PlanOperation(skill, root, off)
+	if op.Direction != "enable" {
+		t.Fatalf("expected enable, got %s", op.Direction)
+	}
+	if op.TargetPath != filepath.Join(root, "legacy") {
+		t.Errorf("expected target in live root, got %s", op.TargetPath)
+	}
+
 	if err := ApplyOperation(op); err != nil {
-		t.Fatalf("expected stale off quarantine to succeed, got: %v", err)
+		t.Fatal(err)
 	}
-	got, err := os.ReadFile(filepath.Join(off, "dup", "SKILL.md"))
-	if err != nil {
-		t.Fatalf("expected live source to be moved into off: %v", err)
+
+	// Should be moved back to live root.
+	if _, err := os.Stat(filepath.Join(root, "legacy", "SKILL.md")); err != nil {
+		t.Errorf("skill should be in live root: %v", err)
 	}
-	if !strings.Contains(string(got), "original") {
-		t.Fatalf("expected normal off entry to contain live source, got: %s", got)
+	if _, err := os.Stat(filepath.Join(off, "legacy")); !os.IsNotExist(err) {
+		t.Error("off dir should be empty after move")
 	}
-	quarantined := filepath.Join(dir, "off-conflicts-20260523-123456", "agents", "dup", "SKILL.md")
-	got, err = os.ReadFile(quarantined)
-	if err != nil {
-		t.Fatalf("expected stale off entry to be quarantined at %s: %v", quarantined, err)
-	}
-	if !strings.Contains(string(got), "stale") {
-		t.Fatalf("expected quarantined entry to contain stale off copy, got: %s", got)
+	// Should NOT have disable-model-invocation (enable cleans it).
+	if IsDisabledByFrontmatter(filepath.Join(root, "legacy", "SKILL.md")) {
+		t.Error("expected frontmatter to be clean after enable")
 	}
 }
 
-func TestApplyOperationReplacesIdenticalStaleOff(t *testing.T) {
+func TestApplyOperationDisableWritesFrontmatterOnly(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, "skills")
 	off := filepath.Join(dir, "off", "agents")
 
-	// writeSkill produces deterministic SKILL.md content, so writing the
-	// same skill into both root and off creates the "identical stale off"
-	// scenario: live and off carry the same content but live should win.
 	writeSkill(t, root, "dup", "shared content")
-	if err := os.MkdirAll(off, 0755); err != nil {
-		t.Fatal(err)
-	}
-	writeSkill(t, off, "dup", "shared content")
-
 	op := Operation{
 		SkillName:  "dup",
 		Source:     "agents",
 		Direction:  "disable",
 		SourcePath: filepath.Join(root, "dup"),
-		TargetPath: filepath.Join(off, "dup"),
+		TargetPath: "", // frontmatter-based, no move
 	}
 	if err := ApplyOperation(op); err != nil {
-		t.Fatalf("expected stale-off replace to succeed, got: %v", err)
+		t.Fatalf("expected disable to succeed, got: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "dup")); !os.IsNotExist(err) {
-		t.Error("live source should have been moved into off")
+	// Skill should stay in live root.
+	if _, err := os.Stat(filepath.Join(root, "dup", "SKILL.md")); err != nil {
+		t.Errorf("live source should remain: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(off, "dup", "SKILL.md")); err != nil {
-		t.Errorf("off entry should exist after replace: %v", err)
+	// Should have frontmatter flag + openai.yaml.
+	if !IsDisabledByFrontmatter(filepath.Join(root, "dup", "SKILL.md")) {
+		t.Error("expected disable-model-invocation: true")
+	}
+	if !HasOpenaiYAMLDisabled(filepath.Join(root, "dup")) {
+		t.Error("expected agents/openai.yaml")
+	}
+	// Off dir should NOT contain the skill.
+	if _, err := os.Stat(filepath.Join(off, "dup")); !os.IsNotExist(err) {
+		t.Error("skill should NOT be moved to off dir")
 	}
 }
 

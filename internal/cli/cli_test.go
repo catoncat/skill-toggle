@@ -100,7 +100,7 @@ func TestEnableMovesSkillBackToSourceRoot(t *testing.T) {
 	}
 }
 
-func TestDisableMovesSkillIntoOffRoot(t *testing.T) {
+func TestDisableMutesSkillViaFrontmatter(t *testing.T) {
 	home := setupHome(t)
 	live := filepath.Join(home, ".claude", "skills")
 	writeSkillFile(t, live, "ctf-web", "Web CTF helpers")
@@ -115,9 +115,22 @@ func TestDisableMovesSkillIntoOffRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	target := filepath.Join(home, ".config", "skill-toggle", "off", "claude", "ctf-web", "SKILL.md")
-	if _, err := os.Stat(target); err != nil {
-		t.Fatalf("expected ctf-web at %s, got %v", target, err)
+	// Skill should stay in live root with frontmatter flag.
+	skillMD := filepath.Join(live, "ctf-web", "SKILL.md")
+	if _, err := os.Stat(skillMD); err != nil {
+		t.Fatalf("skill should remain in live root: %v", err)
+	}
+	data, err := os.ReadFile(skillMD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "disable-model-invocation: true") {
+		t.Error("expected disable-model-invocation: true in SKILL.md")
+	}
+	// agents/openai.yaml should exist.
+	yamlPath := filepath.Join(live, "ctf-web", "agents", "openai.yaml")
+	if _, err := os.Stat(yamlPath); err != nil {
+		t.Errorf("expected agents/openai.yaml: %v", err)
 	}
 }
 

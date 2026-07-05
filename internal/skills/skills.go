@@ -1,7 +1,6 @@
 package skills
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -48,6 +47,10 @@ type Skill struct {
 	Path             string
 	IsSymlink        bool
 	Protected        bool
+	// IsOffDir is true when the skill was found in the legacy off/
+	// directory (physically moved by the old mechanism). Skills muted
+	// via frontmatter in a live root have IsOffDir=false.
+	IsOffDir bool
 	// IsDuplicate is true when this skill's canonical (resolved) path was
 	// already produced by an earlier entry — i.e. one source root is a
 	// symlink to another (e.g. ~/.claude/skills -> ~/.agents/skills).
@@ -100,30 +103,33 @@ type LinkOp struct {
 }
 
 // ParseFrontmatter parses YAML frontmatter from a SKILL.md file.
-// Returns (displayName, description). On read errors or missing frontmatter,
-// the parent directory name is used as the display name.
-func ParseFrontmatter(skillMDPath string) (string, string, error) {
+// Returns (displayName, description, disabled). The disabled bool is true
+// when `disable-model-invocation: true` is present in the frontmatter.
+// On read errors or missing frontmatter, the parent directory name is used
+// as the display name and disabled is false.
+func ParseFrontmatter(skillMDPath string) (string, string, bool, error) {
 	data, err := os.ReadFile(skillMDPath)
 	if err != nil {
 		parentDir := filepath.Base(filepath.Dir(skillMDPath))
-		return parentDir, "", nil
+		return parentDir, "", false, nil
 	}
 	text := string(data)
 	parentDir := filepath.Base(filepath.Dir(skillMDPath))
 
 	if !strings.HasPrefix(text, "---\n") {
-		return parentDir, "", nil
+		return parentDir, "", false, nil
 	}
 
 	end := strings.Index(text[4:], "\n---")
 	if end == -1 {
-		return parentDir, "", nil
+		return parentDir, "", false, nil
 	}
 
 	block := text[4 : 4+end]
 
 	name := parentDir
 	description := ""
+	disabled := false
 	inDescription := false
 
 	lines := strings.Split(strings.TrimRight(block, "\n\r"), "\n")
@@ -132,6 +138,12 @@ func ParseFrontmatter(skillMDPath string) (string, string, error) {
 		if strings.HasPrefix(line, "name:") {
 			parts := strings.SplitN(line, ":", 2)
 			name = strings.Trim(strings.TrimSpace(parts[1]), "'\"")
+			inDescription = false
+			continue
+		}
+		if strings.HasPrefix(line, "disable-model-invocation:") {
+			val := strings.TrimSpace(strings.TrimPrefix(line, "disable-model-invocation:"))
+			disabled = val == "true"
 			inDescription = false
 			continue
 		}
@@ -158,7 +170,7 @@ func ParseFrontmatter(skillMDPath string) (string, string, error) {
 
 	description = strings.Join(strings.Fields(description), " ")
 
-	return name, description, nil
+	return name, description, disabled, nil
 }
 
 // HasSkillMD checks whether path is a directory containing SKILL.md.
@@ -199,7 +211,7 @@ func ScanRoot(root, source, status string) ([]Skill, error) {
 			continue
 		}
 
-		displayName, description, _ := ParseFrontmatter(filepath.Join(entryPath, "SKILL.md"))
+		displayName, description, frontmatterDisabled, _ := ParseFrontmatter(filepath.Join(entryPath, "SKILL.md"))
 
 		isSymlink := false
 		if fi, err := os.Lstat(entryPath); err == nil {
@@ -214,16 +226,27 @@ func ScanRoot(root, source, status string) ([]Skill, error) {
 			}
 		}
 
+		// When scanning a live root, the frontmatter flag overrides the
+		// default status to "disabled". When scanning an off directory
+		// (legacy physical-move mechanism), status is already "disabled"
+		// and the skill is physically outside the live root.
+		actualStatus := status
+		isOffDir := status == "disabled"
+		if status == "enabled" && frontmatterDisabled {
+			actualStatus = "disabled"
+		}
+
 		skills = append(skills, Skill{
 			Name:             name,
 			Source:           source,
 			DisplayName:      displayName,
 			Description:      description,
 			DescriptionChars: len(description),
-			Status:           status,
+			Status:           actualStatus,
 			Path:             entryPath,
 			IsSymlink:        isSymlink,
 			Protected:        protected,
+			IsOffDir:         isOffDir,
 		})
 	}
 
@@ -410,8 +433,9 @@ func isProtected(name string) bool {
 	return false
 }
 
-// PlanOperation builds the move that would flip a skill's status.
-// liveRoot is the skill's source root; offRoot is the global off directory.
+// PlanOperation builds the operation that would flip a skill's status.
+// liveRoot is the skill's source root; offRoot is the global off directory
+// (only used for legacy off-dir skills that need to be moved back).
 func PlanOperation(skill Skill, liveRoot, offRoot string) Operation {
 	if skill.Status == "enabled" {
 		return Operation{
@@ -419,15 +443,21 @@ func PlanOperation(skill Skill, liveRoot, offRoot string) Operation {
 			Source:     skill.Source,
 			Direction:  "disable",
 			SourcePath: skill.Path,
-			TargetPath: filepath.Join(OffRootForSource(offRoot, skill.Source), skill.Name),
+			TargetPath: "", // frontmatter-based, no move
 		}
+	}
+	// For disabled skills: if in off dir (legacy), we need the live root
+	// path to move it back. If in live root (frontmatter-muted), no move.
+	targetPath := ""
+	if skill.IsOffDir {
+		targetPath = filepath.Join(liveRoot, skill.Name)
 	}
 	return Operation{
 		SkillName:  skill.Name,
 		Source:     skill.Source,
 		Direction:  "enable",
 		SourcePath: skill.Path,
-		TargetPath: filepath.Join(liveRoot, skill.Name),
+		TargetPath: targetPath,
 	}
 }
 
@@ -441,8 +471,10 @@ func PlanOperations(skills []Skill, sourceRoots map[string]string, offRoot strin
 	return ops
 }
 
-// ApplyOperation executes a single planned move. It validates source existence,
-// SKILL.md presence, protected names, and target availability before renaming.
+// ApplyOperation executes a single planned operation. For the frontmatter-
+// based mechanism, this edits SKILL.md and agents/openai.yaml in place.
+// For legacy off-dir skills, it first moves the directory back to the live
+// root, then cleans frontmatter.
 func ApplyOperation(op Operation) error {
 	if isProtected(op.SkillName) {
 		return fmt.Errorf("%s is protected", op.SkillName)
@@ -459,88 +491,52 @@ func ApplyOperation(op Operation) error {
 		return fmt.Errorf("source does not contain SKILL.md: %s", op.SourcePath)
 	}
 
-	targetDir := filepath.Dir(op.TargetPath)
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		return fmt.Errorf("failed to create target directory: %w", err)
-	}
+	switch op.Direction {
+	case "disable":
+		// Write disable-model-invocation: true into SKILL.md frontmatter
+		// (PI, Claude Code, Cursor) and create agents/openai.yaml
+		// (Codex). Both together ensure cross-tool auto-invocation stop.
+		if err := SetDisableModelInvocation(skillMDPath); err != nil {
+			return fmt.Errorf("failed to set disable-model-invocation: %w", err)
+		}
+		if err := CreateOpenaiYAML(op.SourcePath); err != nil {
+			return fmt.Errorf("failed to create agents/openai.yaml: %w", err)
+		}
+		return nil
 
-	_, errStat := os.Stat(op.TargetPath)
-	_, errLstat := os.Lstat(op.TargetPath)
-	if errStat == nil || errLstat == nil {
-		// A target collision on disable usually means a stale off entry from
-		// a previous disable that got re-activated by an external process
-		// (project sync, npx update). The live source is the truth, so if
-		// the two SKILL.md files match we replace the stale off copy. If
-		// they differ we refuse and surface the path so the user can pick.
-		if op.Direction == "disable" {
-			same, cmpErr := sameSkillMD(op.SourcePath, op.TargetPath)
-			if cmpErr != nil {
-				return fmt.Errorf("target already exists at %s and could not be compared: %w", op.TargetPath, cmpErr)
+	case "enable":
+		// If the skill is in the legacy off directory, move it back to
+		// the live root first.
+		if op.TargetPath != "" && op.TargetPath != op.SourcePath {
+			targetDir := filepath.Dir(op.TargetPath)
+			if err := os.MkdirAll(targetDir, 0755); err != nil {
+				return fmt.Errorf("failed to create target directory: %w", err)
 			}
-			if same {
-				if err := os.RemoveAll(op.TargetPath); err != nil {
-					return fmt.Errorf("failed to remove stale off entry %s: %w", op.TargetPath, err)
-				}
-			} else {
-				if _, err := quarantineOffConflict(op); err != nil {
-					return err
-				}
+			if _, err := os.Stat(op.TargetPath); err == nil {
+				return fmt.Errorf("target already exists: %s", op.TargetPath)
 			}
-		} else {
-			return fmt.Errorf("target already exists: %s", op.TargetPath)
+			if err := os.Rename(op.SourcePath, op.TargetPath); err != nil {
+				return fmt.Errorf("failed to move %s to %s: %w", op.SourcePath, op.TargetPath, err)
+			}
+			op.SourcePath = op.TargetPath
+			skillMDPath = filepath.Join(op.SourcePath, "SKILL.md")
 		}
-	}
+		// Remove disable-model-invocation from SKILL.md frontmatter
+		// and delete agents/openai.yaml to restore auto-invocation.
+		if err := RemoveDisableModelInvocation(skillMDPath); err != nil {
+			return fmt.Errorf("failed to remove disable-model-invocation: %w", err)
+		}
+		if err := RemoveOpenaiYAML(op.SourcePath); err != nil {
+			return fmt.Errorf("failed to remove agents/openai.yaml: %w", err)
+		}
+		return nil
 
-	if err := os.Rename(op.SourcePath, op.TargetPath); err != nil {
-		return fmt.Errorf("failed to move %s to %s: %w", op.SourcePath, op.TargetPath, err)
+	default:
+		return fmt.Errorf("unknown direction: %s", op.Direction)
 	}
-
-	return nil
 }
 
-func quarantineOffConflict(op Operation) (string, error) {
-	// TargetPath is <offRoot>/<source>/<name>; keep conflicts beside offRoot
-	// so the normal disabled scan does not keep treating them as state.
-	offRoot := filepath.Dir(filepath.Dir(op.TargetPath))
-	configDir := filepath.Dir(offRoot)
-	stamp := now().Format("20060102-150405")
-	base := filepath.Join(configDir, "off-conflicts-"+stamp, op.Source)
 
-	var quarantinePath string
-	for i := 0; i < 100; i++ {
-		name := op.SkillName
-		if i > 0 {
-			name = fmt.Sprintf("%s-%02d", op.SkillName, i)
-		}
-		candidate := filepath.Join(base, name)
-		if _, err := os.Lstat(candidate); os.IsNotExist(err) {
-			quarantinePath = candidate
-			break
-		}
-	}
-	if quarantinePath == "" {
-		return "", fmt.Errorf("failed to choose conflict quarantine path for %s", op.TargetPath)
-	}
-	if err := os.MkdirAll(filepath.Dir(quarantinePath), 0755); err != nil {
-		return "", fmt.Errorf("failed to create conflict quarantine directory: %w", err)
-	}
-	if err := os.Rename(op.TargetPath, quarantinePath); err != nil {
-		return "", fmt.Errorf("failed to quarantine stale off entry %s to %s: %w", op.TargetPath, quarantinePath, err)
-	}
-	return quarantinePath, nil
-}
-
-func sameSkillMD(aDir, bDir string) (bool, error) {
-	a, err := os.ReadFile(filepath.Join(aDir, "SKILL.md"))
-	if err != nil {
-		return false, err
-	}
-	b, err := os.ReadFile(filepath.Join(bDir, "SKILL.md"))
-	if err != nil {
-		return false, err
-	}
-	return bytes.Equal(a, b), nil
-}
 
 // ApplyOperations applies all operations in order, stopping at the first
 // failure and reporting which operation failed.
