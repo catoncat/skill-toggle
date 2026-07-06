@@ -27,7 +27,7 @@ Mark batch changes with `Space`, apply them with `t`, or press `L` to expose one
 - One TUI for the Agents, Claude, and Codex skill roots — no profile switching.
 - Symlink-aware by default: hides duplicate rows when one source root points at another, while `.` / `--show-linked` can reveal every row.
 - Per-skill linking with `L`: expose one real skill folder to another root through a symlink, or unlink an existing symlink without touching the real folder.
-- Safe toggles: enable/disable uses `os.Rename`, refuses overwrites, and protects `.system`.
+- Safe toggles: enable/disable writes `disable-model-invocation: true` to SKILL.md frontmatter (PI, Claude Code, Cursor) and creates `agents/openai.yaml` with `allow_implicit_invocation: false` (Codex). Skills stay in place — no directory moves, no restart needed.
 - Managed update guard: reads `.skill-lock.json` and refuses one-off updates for hand-placed skills that `npx skills update` cannot safely refresh.
 - Upstream freshness check with `F`: checks whether a managed skill is behind its upstream hash without installing anything.
 - Fast narrowing: `a` / `e` / `d` filters, text search, description-size sorting, and inline/full-screen SKILL.md preview.
@@ -43,7 +43,7 @@ Mark batch changes with `Space`, apply them with `t`, or press `L` to expose one
 - Sorts by name, description size descending, or description size ascending.
 - Runs `npx skills update` for one enabled managed skill or all global skills.
 - Checks a managed skill's upstream freshness without installing updates.
-- Avoids deletion: toggling only renames/moves folders or symlinks.
+- Avoids deletion: toggling only edits frontmatter and openai.yaml in place. Skills are never moved or deleted.
 
 ## Install
 
@@ -153,45 +153,45 @@ Live skill roots:
 ~/.codex/skills/<name>/SKILL.md
 ```
 
-Disabled skills land under one global directory, partitioned by source so the tool can move each one back to the right root:
+Disabled (muted) skills stay in their live root. The `disable` command writes two things:
 
-```text
-~/.config/skill-toggle/off/<source>/<name>/SKILL.md
-```
+1. `disable-model-invocation: true` in `SKILL.md` frontmatter — prevents PI, Claude Code, Cursor from injecting the skill's description into context or auto-triggering it.
+2. `agents/openai.yaml` with `allow_implicit_invocation: false` — prevents Codex from auto-triggering the skill.
 
-Toggle is always `os.Rename` between the live root and the off path. The tool refuses to overwrite an existing target and refuses protected names (`.system`).
+Explicit invocation (`/skill` in PI, `$skill` in Codex) still works for muted skills.
 
-`SKILL_TOGGLE_OFF_ROOT` and `SKILL_TOGGLE_CONFIG_DIR` are honored mainly for tests and isolated environments.
+The `enable` command removes both. Skills are never moved or deleted.
 
-## Migrating from the Profile-Era Layout
+`SKILL_TOGGLE_OFF_ROOT` and `SKILL_TOGGLE_CONFIG_DIR` are honored mainly for tests and isolated environments. Legacy off directories are still scanned read-only for backward compatibility.
 
-Earlier versions stored disabled skills under per-profile paths:
+## Migrating from the Physical-Move Era
 
-```text
-~/.config/toggle-skills/off/agents/<name>
-~/.config/toggle-skills/off/claude/<name>
-~/.config/toggle-skills/off/codex/<name>
-~/.<source>/skills-disabled/<name>
-```
+Earlier versions physically moved skill directories to an off directory (`~/.config/skill-toggle/off/<source>/`). The current version uses frontmatter-based muting instead. Legacy off directories and `~/.<source>/skills-disabled/` are still scanned read-only so existing disabled skills show up in the list. Use `skill-toggle enable <name>` to move them back to the live root and clean their frontmatter in one step.
 
-These directories are still scanned read-only — anything sitting there shows up in the Disabled panel. Newly-disabled skills are written to the new layout (`~/.config/skill-toggle/off/<source>/<name>`). When you're ready, move the legacy contents over manually:
+To migrate all legacy disabled skills at once:
 
 ```bash
-mkdir -p ~/.config/skill-toggle/off
+# Move each off-dir skill back to its live root, then re-disable with frontmatter
 for src in agents claude codex; do
-  if [ -d ~/.config/toggle-skills/off/$src ]; then
-    mv ~/.config/toggle-skills/off/$src ~/.config/skill-toggle/off/
-  fi
+  off=~/.config/skill-toggle/off/$src
+  live=~/$src/skills
+  [ -d "$off" ] || continue
+  for d in "$off"/*/; do
+    [ -d "$d" ] || continue
+    name=$(basename "$d")
+    if [ -d "$live/$name" ]; then
+      rm -rf "$d"  # live root already has it, just delete stale off copy
+    else
+      mv "$d" "$live/$name"  # move back to live root
+    fi
+    skill-toggle disable "$name" --source "$src"  # apply frontmatter
+  done
 done
 ```
 
-The tool will not delete or rewrite the legacy directories on its own.
-
 ## Codex / Claude Notes
 
-Codex and Claude read skills at session start and cache the visible skill metadata for the running session. After toggling skills, open a new session to see the updated list and the context-budget effect.
-
-This tool manages folder-based user skills only. Plugin-provided skills and bundled system skills are controlled by Codex/Claude configuration, not by moving folders out of the live roots.
+PI detects frontmatter changes on its next skill scan (cached with TTL). Codex detects SKILL.md and agents/openai.yaml changes automatically. Neither requires a restart after toggling.
 
 ## Development
 

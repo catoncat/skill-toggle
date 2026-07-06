@@ -27,7 +27,7 @@
 - 一个 TUI 管理 Agents、Claude、Codex 三套 skill 根目录，不需要切 profile。
 - 默认识别软连接 root：如果某个 source root 指向另一个 root，会隐藏重复行；用 `.` 或 `--show-linked` 可以展开所有来源。
 - 支持单 skill 软连接：按 `L` 可以把一个真实 skill 目录以 symlink 形式暴露到其他 root，也可以只移除已有 symlink。
-- 安全切换：启用/禁用走 `os.Rename`，拒绝覆盖目标，并保护 `.system`。
+- 安全切换：enable/disable 写入 `disable-model-invocation: true` 到 SKILL.md frontmatter（PI、Claude Code、Cursor）并创建 `agents/openai.yaml` 设置 `allow_implicit_invocation: false`（Codex）。skill 原地不动，无需重启。
 - 托管更新保护：读取 `.skill-lock.json`，对手工放置的 skill 拒绝单独更新，避免误交给 `npx skills update`。
 - 上游新鲜度检查：按 `F` 只检查托管 skill 是否落后于上游 hash，不安装更新。
 - 快速收窄列表：`a` / `e` / `d` 过滤、文本搜索、按描述长度排序、内嵌/全屏 SKILL.md 预览。
@@ -43,7 +43,7 @@
 - 支持按名称、描述长度降序、描述长度升序排序。
 - 对托管 skill 运行 `npx skills update`，支持单个 skill 或全局批量更新。
 - 可以只检查托管 skill 的上游新鲜度，不安装任何更新。
-- 避免删除：切换只会 rename / move 目录或 symlink。
+- 避免删除：切换只编辑 frontmatter 和 openai.yaml，skill 原地不动。
 
 ## 安装
 
@@ -146,45 +146,24 @@ Live skill roots：
 ~/.codex/skills/<name>/SKILL.md
 ```
 
-禁用后的 skill 会进入一个全局 off 目录，并按 source 分区，这样工具能把它移动回正确的 root：
+禁用（muted）的 skill 留在 live root 中。`disable` 命令写入两样东西：
 
-```text
-~/.config/skill-toggle/off/<source>/<name>/SKILL.md
-```
+1. `SKILL.md` frontmatter 中的 `disable-model-invocation: true` —— 阻止 PI、Claude Code、Cursor 将 skill description 注入上下文或自动触发。
+2. `agents/openai.yaml` 中的 `allow_implicit_invocation: false` —— 阻止 Codex 自动触发 skill。
 
-Toggle 始终是在 live root 和 off path 之间做 `os.Rename`。工具会拒绝覆盖已有目标，也会拒绝受保护名称（`.system`）。
+显式调用（PI 中 `/skill`，Codex 中 `$skill`）对 muted skill 仍然有效。
 
-`SKILL_TOGGLE_OFF_ROOT` 和 `SKILL_TOGGLE_CONFIG_DIR` 主要用于测试和隔离环境。
+`enable` 命令移除两样东西。skill 永远不会被移动或删除。
 
-## 从旧 profile 布局迁移
+`SKILL_TOGGLE_OFF_ROOT` 和 `SKILL_TOGGLE_CONFIG_DIR` 主要用于测试和隔离环境。旧 off 目录仍会以只读方式扫描以保持向后兼容。
 
-早期版本把禁用 skill 存在按 profile 分开的路径下：
+## 从物理移动机制迁移
 
-```text
-~/.config/toggle-skills/off/agents/<name>
-~/.config/toggle-skills/off/claude/<name>
-~/.config/toggle-skills/off/codex/<name>
-~/.<source>/skills-disabled/<name>
-```
-
-这些目录仍会以只读方式扫描；放在里面的内容会显示在 Disabled 面板中。新禁用的 skill 会写入新布局（`~/.config/skill-toggle/off/<source>/<name>`）。准备好后，可以手动迁移：
-
-```bash
-mkdir -p ~/.config/skill-toggle/off
-for src in agents claude codex; do
-  if [ -d ~/.config/toggle-skills/off/$src ]; then
-    mv ~/.config/toggle-skills/off/$src ~/.config/skill-toggle/off/
-  fi
-done
-```
-
-工具不会主动删除或重写旧目录。
+早期版本会将 skill 目录物理移动到 off 目录（`~/.config/skill-toggle/off/<source>/`）。当前版本使用 frontmatter 机制。旧 off 目录和 `~/.<source>/skills-disabled/` 仍会以只读方式扫描，现有的禁用 skill 会出现在列表中。使用 `skill-toggle enable <name>` 可以一步将其移回 live root 并清除 frontmatter。
 
 ## Codex / Claude 注意事项
 
-Codex 和 Claude 会在 session 启动时读取 skill，并缓存当前可见的 skill metadata。切换 skill 后，需要打开新 session 才能看到更新后的列表和上下文预算变化。
-
-这个工具只管理基于文件夹的用户 skills。插件提供的 skills 和内置系统 skills 由 Codex / Claude 配置控制，不应该通过移动 live roots 外的文件夹来管理。
+PI 在下次 skill 扫描时检测 frontmatter 变更（缓存有 TTL）。Codex 自动检测 SKILL.md 和 agents/openai.yaml 变更。两者在切换后都不需要重启。
 
 ## 开发
 
