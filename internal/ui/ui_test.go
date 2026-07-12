@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 // defaultSources mirrors the production source order used by the TUI.
@@ -106,6 +107,48 @@ func TestSkillRowEnabledHasNoForegroundOverride(t *testing.T) {
 	// inject. Spot-check that "plain" appears unwrapped by an ANSI esc.
 	if !strings.Contains(row, "plain") {
 		t.Fatalf("expected name 'plain' literal in row: %q", row)
+	}
+}
+
+func TestSkillRowDisabledUsesFaintNotANSI8(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	enabled := SkillRow("enabled-skill", realIn("agents"), defaultSources, "desc", 5, "enabled", false, false, false, 16, 80)
+	disabled := SkillRow("disabled-skill", realIn("agents"), defaultSources, "desc", 5, "disabled", false, false, false, 16, 80)
+
+	// Disabled name must be dimmed with SGR 2 (faint), not hard-coded
+	// palette index 8 / bright-black (\x1b[90m), which inverts on some
+	// dark themes where color 8 is brighter than the default fg.
+	if !strings.Contains(disabled, "\x1b[2m") {
+		t.Fatalf("disabled row should use faint (SGR 2): %q", disabled)
+	}
+	if strings.Contains(disabled, "\x1b[90m") || strings.Contains(disabled, "\x1b[38;5;8m") {
+		t.Fatalf("disabled row must not hard-code ANSI color 8: %q", disabled)
+	}
+	// Enabled name stays on the terminal default — no faint / no color on the name itself.
+	nameIdx := strings.Index(enabled, "enabled-skill")
+	if nameIdx < 0 {
+		t.Fatalf("enabled name missing: %q", enabled)
+	}
+	prefix := enabled[:nameIdx]
+	if strings.Contains(prefix, "\x1b[2m") || strings.Contains(prefix, "\x1b[90m") {
+		t.Fatalf("enabled name should not be pre-styled faint/color-8: %q", enabled)
+	}
+}
+
+func TestSkillRowSelectedReverseHasNoMidRowReset(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	row := SkillRow("plain", realIn("agents"), defaultSources, "desc", 5, "enabled", true, true, false, 12, 80)
+	if !strings.HasPrefix(row, "\x1b[7m") {
+		t.Fatalf("selected row should start with reverse (SGR 7): %q", row)
+	}
+	// A mid-row \x1b[0m would cancel reverse and make later cells look
+	// "wrong" relative to the name — the classic dark-mode inversion bug.
+	body := row[len("\x1b[7m"):]
+	if idx := strings.Index(body, "\x1b[0m"); idx >= 0 && idx < len(body)-len("\x1b[0m") {
+		// Allow a single trailing reset at the very end only.
+		if !strings.HasSuffix(row, "\x1b[0m") || strings.Count(body, "\x1b[0m") != 1 {
+			t.Fatalf("selected row has mid-row reset that breaks reverse: %q", row)
+		}
 	}
 }
 

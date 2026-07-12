@@ -63,6 +63,14 @@ type Model struct {
 	idx    int
 	offset int
 
+	// Snapshot of idx/offset taken just before a search session starts.
+	// Restored when the query is cleared (esc), so paging into the list,
+	// searching, then cancelling lands the user back where they were.
+	// preSearchSaved is false when no snapshot is held.
+	preSearchIdx    int
+	preSearchOffset int
+	preSearchSaved  bool
+
 	// Filter / sort.
 	query        string
 	statusFilter string

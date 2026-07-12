@@ -331,12 +331,12 @@ func (m Model) handleNormalKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyCtrlU:
 		return m.moveCursorBy(-m.listPageSize() / 2), nil
 	case tea.KeyEsc:
-		// Esc clears the active filter first, then status messages, so the
-		// user has a fast path back from any "stuck" state without having
-		// to delete the search query character by character.
-		if m.query != "" {
-			m.query = ""
-			m.refreshLists()
+		// Esc clears the active search first (restoring the pre-search
+		// scroll position), then status messages, so the user has a fast
+		// path back from any "stuck" state without having to delete the
+		// search query character by character.
+		if m.query != "" || m.preSearchSaved {
+			m.clearSearch(true /* restore */)
 			m.message = "search cleared"
 			m.messageType = "info"
 			return m, nil
@@ -368,6 +368,11 @@ func (m Model) handleNormalKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.setFilter(filterDisabled), nil
 	case "/":
 		m.mode = modeSearch
+		// Snapshot the current scroll position once, before any query is
+		// typed, so cancelling search can put the list back exactly where
+		// it was (including after paging). Subsequent `/` while a query is
+		// already active keeps the original snapshot.
+		m.savePreSearchPosition()
 		return m, nil
 	case "p":
 		return m.openPreviewFull()
@@ -520,29 +525,76 @@ func (m Model) applyPendingLink(idx int) (tea.Model, tea.Cmd) {
 
 // --- search mode ---
 
+// savePreSearchPosition records idx/offset the first time a search session
+// begins. Later keystrokes (or re-entering `/` with an existing query) leave
+// the snapshot alone so cancel always returns to the original place.
+func (m *Model) savePreSearchPosition() {
+	if m.preSearchSaved {
+		return
+	}
+	m.preSearchIdx = m.idx
+	m.preSearchOffset = m.offset
+	m.preSearchSaved = true
+}
+
+// clearSearch drops the query. When restore is true (esc / cancel), the
+// pre-search cursor and viewport are put back; when false the caller has
+// already decided the new position.
+func (m *Model) clearSearch(restore bool) {
+	m.query = ""
+	if restore && m.preSearchSaved {
+		m.idx = m.preSearchIdx
+		m.offset = m.preSearchOffset
+	}
+	m.preSearchSaved = false
+	m.refreshLists()
+}
+
+// setSearchQuery updates the live query. Entering a non-empty query always
+// jumps the viewport to the first page of matches; clearing back to "" while
+// still in search mode restores the snapshot without discarding it (so a
+// later cancel / retype still knows the original place).
+func (m *Model) setSearchQuery(q string) {
+	wasEmpty := m.query == ""
+	m.query = q
+	switch {
+	case q == "":
+		if m.preSearchSaved {
+			m.idx = m.preSearchIdx
+			m.offset = m.preSearchOffset
+		}
+	default:
+		if wasEmpty {
+			m.savePreSearchPosition()
+		}
+		// New / refined search always starts at the top of the match list.
+		m.idx = 0
+		m.offset = 0
+	}
+	m.refreshLists()
+}
+
 func (m Model) handleSearchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key.Type {
 	case tea.KeyEnter:
+		// Keep the query and the match-list position; snapshot stays so a
+		// later esc in normal mode can still restore the pre-search place.
 		m.mode = modeNormal
 		return m, nil
 	case tea.KeyEsc:
 		m.mode = modeNormal
-		m.query = ""
-		m.refreshLists()
+		m.clearSearch(true /* restore */)
 		return m, nil
 	case tea.KeyBackspace:
 		if len(m.query) > 0 {
-			m.query = m.query[:len(m.query)-1]
-			m.refreshLists()
+			m.setSearchQuery(m.query[:len(m.query)-1])
 		}
 		return m, nil
 	case tea.KeyRunes:
-		m.query += string(key.Runes)
-		m.refreshLists()
+		m.setSearchQuery(m.query + string(key.Runes))
 		return m, nil
 	case tea.KeySpace:
-		m.query += " "
-		m.refreshLists()
+		m.setSearchQuery(m.query + " ")
 		return m, nil
 	}
 	return m, nil

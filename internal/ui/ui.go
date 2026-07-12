@@ -32,10 +32,12 @@ var (
 	// Accent — used by key hints, search prompt, markdown headings.
 	Accent = lipgloss.Color("4")
 
-	// Muted secondary text (sources, char counts, hint labels).
+	// Muted secondary text (key-hint labels, inactive titles, chrome).
+	// Not used for enabled/disabled skill status — that distinction is
+	// conveyed with Faint so it stays relative to the terminal default.
 	Muted = lipgloss.Color("8")
 
-	// Subtle — even quieter than Muted (description on disabled rows).
+	// Subtle — reserved for chrome that should match Muted under ANSI-16.
 	Subtle = lipgloss.Color("8")
 
 	// Semantic statuses.
@@ -278,10 +280,18 @@ func FormatPresence(presence map[string]string, sources []string) string {
 //
 // Presence column width equals len(sources) (3 for the built-in trio).
 //
-// Status (ON/OFF) is conveyed by panel placement plus name color: enabled
-// rows leave the foreground unset (terminal default — adapts to dark/light
-// themes without relying on Lip Gloss adaptive color), disabled rows use
-// Muted. Selection uses Reverse so any terminal theme stays legible.
+// Status (ON/OFF) is conveyed by name weight / dimming, not by a hardcoded
+// palette color:
+//
+//   - enabled  → terminal default foreground (no Lip Gloss color set)
+//   - disabled → Faint (SGR 2). Faint is a relative attribute, so it stays
+//     dimmer than the default on both light and dark themes. Hard-coding
+//     ANSI index 8 ("bright black") used to look inverted on some dark
+//     themes where color 8 is brighter than the default fg.
+//
+// Selection uses Reverse on a color-free row. Nested Foreground styles emit
+// \x1b[0m resets that cancel reverse mid-row and make enabled/disabled look
+// swapped under the cursor; building the selected row plain avoids that.
 func SkillRow(name string, presence map[string]string, sources []string, description string, descChars int, status string, selected, activePanel, staged bool, nameColW, width int) string {
 	if width < 10 {
 		return TrimToWidth(name, width)
@@ -292,11 +302,6 @@ func SkillRow(name string, presence map[string]string, sources []string, descrip
 		cursor = "▌ "
 	} else if selected {
 		cursor = "› "
-	}
-
-	stagedMarker := " "
-	if staged {
-		stagedMarker = lipgloss.NewStyle().Foreground(Warning).Bold(true).Render("~")
 	}
 
 	presenceW := len(sources)
@@ -328,40 +333,68 @@ func SkillRow(name string, presence map[string]string, sources []string, descrip
 		descW = 0
 	}
 
-	nameStyle := lipgloss.NewStyle()
-	descStyle := lipgloss.NewStyle().Foreground(Muted)
-	if status != "enabled" {
-		nameStyle = lipgloss.NewStyle().Foreground(Muted)
-		descStyle = lipgloss.NewStyle().Foreground(Subtle)
-	}
-	presenceStyle := lipgloss.NewStyle().Foreground(Muted)
-	charsStyle := lipgloss.NewStyle().Foreground(Subtle)
-
 	presenceText := FormatPresence(presence, sources)
+	nameText := PadRight(TrimToWidth(name, nameW), nameW)
+	presencePlain := PadRight(TrimToWidth(presenceText, presenceW), presenceW)
+	charsPlain := PadRight(FormatDescChars(descChars), charsW)
+	var descPlain string
+	if descW > 0 {
+		descPlain = TrimToWidth(description, descW)
+	}
+
+	// Selected + focused: plain text + reverse. No per-cell Foreground —
+	// nested SGR (including a colored staged marker) would emit \x1b[0m
+	// mid-row and cancel reverse, which is what made enabled/disabled
+	// look inverted under the cursor in dark themes.
+	if selected && activePanel {
+		stagedMarker := " "
+		if staged {
+			stagedMarker = "~"
+		}
+		parts := []string{stagedMarker, cursor, nameText, " ", presencePlain, " ", charsPlain}
+		if descW > 0 {
+			parts = append(parts, " ", descPlain)
+		}
+		row := strings.Join(parts, "")
+		rowWidth := lipgloss.Width(row)
+		if rowWidth < width {
+			row += strings.Repeat(" ", width-rowWidth)
+		}
+		return lipgloss.NewStyle().Reverse(true).Render(row)
+	}
+
+	stagedMarker := " "
+	if staged {
+		stagedMarker = lipgloss.NewStyle().Foreground(Warning).Bold(true).Render("~")
+	}
+
+	disabled := status != "enabled"
+	nameStyle := lipgloss.NewStyle()
+	descStyle := lipgloss.NewStyle().Faint(true)
+	if disabled {
+		// Whole disabled name is faint so it is clearly secondary to
+		// enabled peers, independent of the terminal's ANSI color-8 mapping.
+		nameStyle = lipgloss.NewStyle().Faint(true)
+	}
+	presenceStyle := lipgloss.NewStyle().Faint(true)
+	charsStyle := lipgloss.NewStyle().Faint(true)
 
 	parts := []string{
 		stagedMarker,
 		cursor,
-		PadRight(nameStyle.Render(TrimToWidth(name, nameW)), nameW),
+		nameStyle.Render(nameText),
 		" ",
-		PadRight(presenceStyle.Render(TrimToWidth(presenceText, presenceW)), presenceW),
+		presenceStyle.Render(presencePlain),
 		" ",
-		PadRight(charsStyle.Render(FormatDescChars(descChars)), charsW),
+		charsStyle.Render(charsPlain),
 	}
 	if descW > 0 {
-		parts = append(parts, " ", descStyle.Render(TrimToWidth(description, descW)))
+		parts = append(parts, " ", descStyle.Render(descPlain))
 	}
 	row := strings.Join(parts, "")
 	rowWidth := lipgloss.Width(row)
 	if rowWidth < width {
 		row += strings.Repeat(" ", width-rowWidth)
-	}
-
-	if selected && activePanel {
-		// Reverse video flips fg/bg using whatever colors the terminal theme
-		// has set, so selection stays legible on light, dark, and high-
-		// contrast schemes without us picking a specific tint.
-		row = lipgloss.NewStyle().Reverse(true).Render(row)
 	}
 	return row
 }

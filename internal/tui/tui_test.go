@@ -272,6 +272,109 @@ func TestEscClearsQueryInNormalMode(t *testing.T) {
 	}
 }
 
+func TestSearchResetsToFirstPageAndEscRestoresScroll(t *testing.T) {
+	// Enough rows that paging past the first screen is possible.
+	all := make([]skills.Skill, 0, 40)
+	for i := 0; i < 40; i++ {
+		name := fmt.Sprintf("skill-%02d", i)
+		all = append(all, makeSkill("agents", name, "enabled", "desc"))
+	}
+	// Sprinkle a match near the top so a search still has results after
+	// the user has scrolled far down the unfiltered list.
+	all = append(all, makeSkill("agents", "needle-item", "enabled", "special"))
+
+	m := newTestModel(80, 20, all)
+	body := m.listBodyHeight()
+	if body < 2 {
+		t.Fatalf("list body too small for paging test: %d", body)
+	}
+
+	// Page down a few times so idx/offset leave the top.
+	m = m.moveCursorBy(body * 2)
+	if m.idx == 0 || m.offset == 0 {
+		t.Fatalf("expected cursor off first page before search, got idx=%d offset=%d", m.idx, m.offset)
+	}
+	savedIdx, savedOffset := m.idx, m.offset
+
+	// Enter search mode — snapshot must capture the paged position.
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	m = next.(Model)
+	if m.mode != modeSearch {
+		t.Fatalf("expected search mode, got %s", m.mode)
+	}
+	if !m.preSearchSaved || m.preSearchIdx != savedIdx || m.preSearchOffset != savedOffset {
+		t.Fatalf("pre-search snapshot wrong: saved=%v idx=%d offset=%d want idx=%d offset=%d",
+			m.preSearchSaved, m.preSearchIdx, m.preSearchOffset, savedIdx, savedOffset)
+	}
+
+	// Typing a query must jump to the first page of matches.
+	next, _ = m.handleSearchKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("needle")})
+	m = next.(Model)
+	if m.query != "needle" {
+		t.Fatalf("expected query=needle, got %q", m.query)
+	}
+	if m.idx != 0 || m.offset != 0 {
+		t.Fatalf("search should reset to first page, got idx=%d offset=%d", m.idx, m.offset)
+	}
+	if len(m.visibleList) != 1 || m.visibleList[0].Name != "needle-item" {
+		t.Fatalf("expected single needle match, got %#v", m.visibleList)
+	}
+
+	// Esc cancels search and restores the pre-search scroll position.
+	next, _ = m.handleSearchKey(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if m.mode != modeNormal {
+		t.Fatalf("esc should leave search mode, got %s", m.mode)
+	}
+	if m.query != "" {
+		t.Fatalf("esc should clear query, got %q", m.query)
+	}
+	if m.preSearchSaved {
+		t.Fatal("snapshot should be cleared after restore")
+	}
+	if m.idx != savedIdx || m.offset != savedOffset {
+		t.Fatalf("esc should restore scroll, got idx=%d offset=%d want idx=%d offset=%d",
+			m.idx, m.offset, savedIdx, savedOffset)
+	}
+}
+
+func TestSearchEnterKeepsQueryEscInNormalRestores(t *testing.T) {
+	all := make([]skills.Skill, 0, 30)
+	for i := 0; i < 30; i++ {
+		all = append(all, makeSkill("agents", fmt.Sprintf("item-%02d", i), "enabled", "d"))
+	}
+	all = append(all, makeSkill("agents", "target-skill", "enabled", "match me"))
+
+	m := newTestModel(80, 20, all)
+	m = m.moveCursorBy(m.listBodyHeight() * 2)
+	savedIdx, savedOffset := m.idx, m.offset
+
+	next, _ := m.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	m = next.(Model)
+	next, _ = m.handleSearchKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("target")})
+	m = next.(Model)
+	// Confirm search with enter — keep query, keep match-list position.
+	next, _ = m.handleSearchKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.mode != modeNormal || m.query != "target" {
+		t.Fatalf("enter should keep query in normal mode, mode=%s query=%q", m.mode, m.query)
+	}
+	if m.idx != 0 {
+		t.Fatalf("match list should still be on first page, idx=%d", m.idx)
+	}
+
+	// Later esc in normal mode clears search and restores the original place.
+	next, _ = m.handleNormalKey(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if m.query != "" {
+		t.Fatalf("normal esc should clear query, got %q", m.query)
+	}
+	if m.idx != savedIdx || m.offset != savedOffset {
+		t.Fatalf("normal esc should restore pre-search scroll, got idx=%d offset=%d want %d/%d",
+			m.idx, m.offset, savedIdx, savedOffset)
+	}
+}
+
 func TestUpdateKeyRefusesUnmanagedSkill(t *testing.T) {
 	m := newTestModel(140, 32, []skills.Skill{
 		{
